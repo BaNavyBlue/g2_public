@@ -93,7 +93,9 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 
 ## Timing
 
-- The board runs segments of `segment_us` (default 1000 µs) on its own clock.
+- The board runs segments of `segment_us` (default 500 µs) on its own clock. With 1 ms
+  frames, each command covers two segments: the first ramps to the new velocity, the
+  second holds it.
 - Each segment takes the newest velocity command:
   - start velocity = the end velocity of the previous segment;
   - end velocity = the command, clamped;
@@ -102,7 +104,11 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
   - A motor whose velocity changes sign within a segment runs that segment at constant
     velocity, because the DDA can't reverse mid-segment.
 - g2core prepares the next segment while the current one runs, so a command reaches the
-  motors 1 to 2 segments (1-2 ms) after it arrives. The driver's feedback loop absorbs this.
+  motors 1 to 2 segments (0.5-1 ms) after it arrives. The driver's feedback loop absorbs this.
+- Segment prep runs in g2core's exec interrupt. `st_prep_line()` uses software doubles
+  (the Cortex-M3 has no FPU): roughly 20-30 µs per moving motor, so about 100 µs of each
+  500 µs segment at worst. Since the velocities already arrive in steps/s, a leaner prep
+  for this path (two multiplies per motor) can replace it if the measurement below says so.
 - If no new command arrived since the last segment, the previous one is reused and
   `stale_segments` counts it.
 - Link budget at 2 Mbaud: MOTION ~34 bytes on the wire, FEEDBACK ~50. That's about 0.4 ms
@@ -135,8 +141,8 @@ for the previous reply; the v0 one-request-in-flight rule still applies to the o
 
 | Offset | Type | Field |
 | --- | --- | --- |
-| 0 | u16 | `watchdog_ms`, 2-100 (suggest 5) |
-| 2 | u16 | `segment_us`, 500-2000 (suggest 1000) |
+| 0 | u16 | `watchdog_ms`, 2-100 (default 5) |
+| 2 | u16 | `segment_us`, 500-2000 (default 500; 1000 is the fallback, no reflash needed) |
 | 4 | u16 | `hold_timeout_ms`, 50-2000 (suggest 250) |
 | 6 | u16 | reserved, 0 |
 | 8 | f32 x4 | `max_vel`, steps/s per motor |
@@ -224,16 +230,42 @@ Only accepted while USB has control.
 6. **LinuxCNC HAL driver:** its own spec. It reads the previous FEEDBACK without blocking,
    updates `pos-fb`, computes velocities and sends MOTION, all in the servo thread.
 
-## Open questions
+## Checks before any motion test
 
-1. **Segment length:** 1000 µs (simpler, 1-2 ms latency) or 500 µs (half the latency,
-   about twice the prep CPU). Suggest starting at 1000.
-2. **Watchdog default:** 5 ms means about 0.4 mm of travel at top speed before the stop
-   begins.
-3. **What USB shows while the Pi has control:**
-   - `stat` unchanged plus a new read-only key for the owner, or
-   - force `stat` 5 (run), so a USB app sees the machine as busy.
-4. **Door with the spindle on:** the cooperative pause above (resumable), or have the board
-   stop at once (simpler, but the LinuxCNC program is lost).
-5. **Probe latch:** report the exact step position at the probe edge in v1, or rely on
-   LinuxCNC's per-period sampling (about 2 µm error at 1 mm/s) until it's needed.
+The no-motion firmware reports these in STATUS. Motion tests start only if they pass:
+
+- Worst-case exec interrupt time below 25% of `segment_us` (125 µs at 500 µs), with all
+  four motors commanded. Otherwise use the leaner prep, or 1000 µs segments.
+- Worst-case gap between main-loop passes while the Pi has control below 2 ms. Frames are
+  handled in the main loop, so a longer stall could trip the watchdog. Otherwise move MOTION
+  handling into the exec interrupt.
+- Zero `stale_segments` and zero receive errors over 10 minutes of 1 kHz MOTION frames at
+  zero velocity.
+
+## Decisions (2026-10-20)
+
+1. **Segment length: 500 µs**, provided the checks above pass.
+2. **Watchdog: 5 ms**, i.e. five missed 1 ms frames:
+   - The Pi's measured real-time jitter is about 0.2 ms worst case under load, so the
+     watchdog doesn't trip on normal jitter.
+   - At top speed the machine travels about 0.4 mm before the stop begins.
+   - LinuxCNC itself reports a realtime fault at stalls of that size.
+3. **USB while the Pi has control (proposed):**
+   - Status reports show `stat` 5 (run), with positions updated live from the step
+     counters. A USB app sees what it would during a job.
+   - Writes are refused with error 106 rather than queued as during a normal job. A move
+     queued now would otherwise run, unexpectedly, after the Pi hands control back.
+4. **Door with the spindle on: cooperative pause, resumable.**
+   - LinuxCNC feed-holds, and the board stops the spindle.
+   - When the door reads closed and the ESC is back (about 5 s if it lost power), LinuxCNC
+     restarts the spindle, waits for it to reach speed, and resumes the program.
+   - A false door signal therefore costs a pause, not the job. Only the board's 250 ms
+     backstop (LinuxCNC failed to pause) ends the program.
+5. **Probe: no latch in v1.**
+   - One step is already 5 µm on X/Y and 2.5 µm on Z, so per-period sampling at
+     slow-touch speeds (about 1-2 µm at 1 mm/s) is below the machine's resolution.
+   - Most of that error is a fixed lag, which cancels when tools are touched off with the
+     same probe routine.
+   - LinuxCNC's motion module can't take a latched position from a driver anyway; it
+     records its own position in the period the probe input changes.
+   - Use a fast seek, back off, then a slow final touch.
