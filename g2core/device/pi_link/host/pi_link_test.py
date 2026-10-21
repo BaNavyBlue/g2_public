@@ -13,6 +13,8 @@ Examples (on the Pi, J17 wired to GPIO14/15; add -b 2000000 for a 2 Mbaud board)
     pi_link_test.py stream -s 10             # ENABLE, 1 kHz zero-velocity MOTION for 10 s, DISABLE
     pi_link_test.py stream -s 3 --gap 1:50   # ...and stop sending for 50 ms at 1 s (watchdog test)
     pi_link_test.py safety ack|clear         # E-stop acknowledge / clear alarm, while USB has control
+    pi_link_test.py move -m 1 -d 1000 -v 400 # motion builds only: motor 1 +1000 steps at 400 steps/s
+    pi_link_test.py move -m 1 -d 4000 -v 2000 --stop watchdog   # ...go silent mid-move
 """
 
 import argparse
@@ -364,6 +366,91 @@ def cmd_stream(link, args):
     return 0
 
 
+def cmd_move(link, args):
+    """Motion builds only. One motor: trapezoid (ramp, cruise, ramp) of `dist` steps at up to
+    `vel` steps/s, sent open-loop as 1 kHz velocity commands under a low max_vel set at ENABLE.
+    Compares the board's step count with the commanded integral. --stop ends it mid-cruise."""
+    m = args.motor - 1
+    max_vel = list(args.max_vel)
+    decel = [args.decel] * 4
+    fb = request_feedback(link, ENABLE, enable_payload(5, 500, 250, max_vel, decel))
+    print("ENABLE: " + format_feedback(fb))
+    if fb["result"] != 0:
+        return 1
+    if fb["flags"] & 8:
+        print("this board's firmware is motion-locked (bench build): nothing will move")
+    start = fb["pos"][m]
+
+    v, a, d = abs(args.vel), args.accel, abs(args.dist)
+    sign = 1 if args.dist >= 0 else -1
+    t_ramp = v / a
+    if a * t_ramp * t_ramp > d:                  # never reaches cruise: triangle profile
+        t_ramp = (d / a) ** 0.5
+        v = a * t_ramp
+    t_cruise = (d - a * t_ramp * t_ramp) / v
+    total = 2 * t_ramp + t_cruise
+    stop_at = t_ramp + t_cruise / 2 if args.stop else None
+
+    def vel_at(t):
+        if t < t_ramp:
+            return a * t
+        if t < t_ramp + t_cruise:
+            return v
+        return max(0.0, v - a * (t - t_ramp - t_cruise))
+
+    ser = link.ser
+    ser.timeout = 0
+    period = 0.001
+    t0 = next_t = time.perf_counter()
+    commanded, buf, last_print, silent, last = 0.0, bytearray(), -1.0, False, None
+    while True:
+        t = time.perf_counter() - t0
+        if t > total + 0.05:
+            break
+        if stop_at is not None and t >= stop_at and not silent:
+            silent = True
+            print("%7.3f s  stopping: %s" % (t, args.stop))
+            if args.stop == "disable":
+                ser.write(build_frame(DISABLE, link.next_seq()))
+        if not silent:
+            vv = sign * vel_at(t)
+            vel = [0.0, 0.0, 0.0, 0.0]
+            vel[m] = vv
+            ser.write(build_frame(MOTION, link.next_seq(), motion_payload(vel)))
+            commanded += vv * period
+        buf += ser.read(4096)
+        while b"\x00" in buf:
+            raw, _, rest = bytes(buf).partition(b"\x00")
+            buf = bytearray(rest)
+            try:
+                frame = cobs_decode(raw)
+            except ValueError:
+                continue
+            if len(frame) < 8 or zlib.crc32(frame[:-4]) != struct.unpack("<I", frame[-4:])[0] or frame[1] != FEEDBACK:
+                continue
+            last = decode_feedback(frame[4:-4])
+            if t - last_print >= 0.25:
+                last_print = t
+                print("%7.3f s  owner %-8s pos %+7d  (commanded so far %+8.1f)"
+                      % (t, name(OWNERS, last["owner"]), last["pos"][m] - start, commanded))
+        if silent and args.stop == "watchdog" and t > stop_at + 0.5:
+            break
+        next_t += period
+        while time.perf_counter() < next_t:
+            pass
+    ser.timeout = link.timeout_s
+    if not silent:
+        fb = request_feedback(link, DISABLE)
+    time.sleep(0.2)
+    fb = request_feedback(link, MOTION, motion_payload())     # just to read owner, reason and position
+    moved = fb["pos"][m] - start
+    print("end: " + format_feedback(fb))
+    print("motor %d moved %+d steps; commanded %+.1f; difference %+.1f"
+          % (args.motor, moved, commanded, moved - commanded))
+    print_diag(link)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", "--port", default="/dev/ttyAMA0")
@@ -381,6 +468,15 @@ def main():
     sub.add_parser("disable")
     p = sub.add_parser("safety")
     p.add_argument("action", choices=["ack", "clear"])
+    p = sub.add_parser("move")
+    p.add_argument("-m", "--motor", type=int, choices=[1, 2, 3, 4], required=True)
+    p.add_argument("-d", "--dist", type=float, required=True, help="steps, signed")
+    p.add_argument("-v", "--vel", type=float, default=400, help="cruise, steps/s")
+    p.add_argument("-a", "--accel", type=float, default=2000, help="steps/s^2")
+    p.add_argument("--decel", type=float, default=20000, help="board stop decel, steps/s^2")
+    p.add_argument("--max-vel", type=float, nargs=4, default=[2000, 2000, 2000, 200],
+                   help="board clamp per motor, steps/s (default ~10, 10, 5 mm/s, 11 deg/s)")
+    p.add_argument("--stop", choices=["watchdog", "disable"])
     p = sub.add_parser("stream")
     p.add_argument("-s", "--seconds", type=float, default=10)
     p.add_argument("--period-ms", type=float, default=1.0)
@@ -390,7 +486,7 @@ def main():
     link = Link(args.port, args.baud, args.timeout)
     return {"ping": cmd_ping, "status": cmd_status, "errors": cmd_errors, "diag": cmd_diag,
             "enable": cmd_enable, "disable": cmd_disable, "safety": cmd_safety,
-            "stream": cmd_stream}[args.cmd](link, args)
+            "stream": cmd_stream, "move": cmd_move}[args.cmd](link, args)
 
 
 if __name__ == "__main__":
