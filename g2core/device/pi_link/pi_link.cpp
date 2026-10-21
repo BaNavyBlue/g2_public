@@ -112,6 +112,7 @@ uint16_t tx_dropped = 0;               // replies dropped because both buffers w
 // While the Pi has control the exec interrupt reads the receive ring (every segment, whatever the
 // main loop is doing); otherwise the main loop does. Only one of them reads at a time.
 volatile bool isr_reads_rx = false;
+uint16_t      frames_in_pass = 0;      // valid frames handled in the current exec pass (DIAG)
 
 struct {
     uint16_t ok;
@@ -445,6 +446,10 @@ struct {
     volatile uint16_t stale_segments;
     volatile uint16_t watchdog_trips;
     volatile uint16_t underruns;
+    volatile uint16_t rx_max_us;        // frame handling part of the exec interrupt
+    volatile uint16_t prep_max_us;      // segment computation part
+    volatile uint16_t frames_max;       // most frames handled in one pass
+    volatile uint32_t exec_max_seg;     // segment number of the slowest pass
     uint32_t          loop_gap_max_us;
 } diag = {};
 
@@ -608,7 +613,7 @@ void send_feedback(uint16_t seq, uint8_t result) {
 }
 
 void send_diag(uint16_t seq) {
-    uint8_t p[24] = {};
+    uint8_t p[32] = {};
     put16(p + 0, diag.exec_max_us);
     put16(p + 2, diag.exec_last_us);
     put32(p + 4, diag.loop_gap_max_us);
@@ -618,6 +623,10 @@ void send_diag(uint16_t seq) {
     put16(p + 16, link_cfg.seg_ticks);
     put16(p + 18, tx_dropped);
     put16(p + 20, diag.underruns);
+    put16(p + 22, diag.rx_max_us);
+    put16(p + 24, diag.prep_max_us);
+    put16(p + 26, diag.frames_max);
+    put32(p + 28, diag.exec_max_seg);
     send_frame(TYPE_DIAG, seq, p, sizeof(p));
 }
 
@@ -697,6 +706,10 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
     diag.segments        = 0;
     diag.stale_segments  = 0;
     diag.underruns       = 0;
+    diag.rx_max_us       = 0;
+    diag.prep_max_us     = 0;
+    diag.frames_max      = 0;
+    diag.exec_max_seg    = 0;
     diag.loop_gap_max_us = 0;
     queued_seq           = seq;
     release_reason       = REASON_NONE;
@@ -838,6 +851,7 @@ void handle_frame(const uint8_t *f, uint16_t len) {
         return;
     }
     counters.ok++;
+    frames_in_pass++;
 
     const uint8_t   type        = f[1];
     const uint16_t  seq         = (uint16_t)f[2] | ((uint16_t)f[3] << 8);
@@ -985,13 +999,22 @@ stat_t pi_link_exec_move() {
     const uint32_t t0 = board_us();
     last_exec_us      = t0;
     if (isr_reads_rx) {
+        frames_in_pass = 0;
         rx_service();           // take in the newest MOTION before preparing the segment
+        const uint32_t rx_us = board_us() - t0;
+        if (rx_us > diag.rx_max_us) {
+            diag.rx_max_us = (uint16_t)rx_us;
+        }
+        if (frames_in_pass > diag.frames_max) {
+            diag.frames_max = frames_in_pass;
+        }
     }
     if (stop_done) {
         return (STAT_NOOP);     // the final zero segment is queued; the main loop hands back to USB
     }
 
-    const MotionCommand &c = cmd[cmd_live];
+    const uint32_t       t_prep = board_us();
+    const MotionCommand &c      = cmd[cmd_live];
     if (owner == OWNER_PI) {
         uint8_t reason = stop_request;
         if ((reason == REASON_NONE) && (us_since(c.rx_us, t0) > (int32_t)link_cfg.watchdog_us)) {
@@ -1053,10 +1076,16 @@ stat_t pi_link_exec_move() {
         stop_done = true;       // this all-zero segment folds the last steps into the step counters
     }
 
-    const uint32_t dt = board_us() - t0;
-    diag.exec_last_us = (uint16_t)dt;
+    const uint32_t t_end = board_us();
+    const uint32_t dt    = t_end - t0;
+    diag.exec_last_us    = (uint16_t)dt;
     if (dt > diag.exec_max_us) {
-        diag.exec_max_us = (uint16_t)dt;
+        diag.exec_max_us  = (uint16_t)dt;
+        diag.exec_max_seg = diag.segments;
+    }
+    const uint32_t prep_us = t_end - t_prep;
+    if (prep_us > diag.prep_max_us) {
+        diag.prep_max_us = (uint16_t)prep_us;
     }
     return (STAT_OK);
 }

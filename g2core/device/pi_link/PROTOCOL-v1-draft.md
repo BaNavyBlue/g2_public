@@ -218,7 +218,7 @@ reply is result 0.
 1 = acknowledge E-stop (as `{"estpc":n}`), 2 = clear alarm or shutdown (as `{"clear":n}`).
 Only accepted while USB has control (result 6 otherwise).
 
-### 0x03 DIAG_REQ (host -> board), no payload; reply 0x83 DIAG, 24 bytes
+### 0x03 DIAG_REQ (host -> board), no payload; reply 0x83 DIAG, 32 bytes
 
 Counters reset at each ENABLE.
 
@@ -233,7 +233,10 @@ Counters reset at each ENABLE.
 | 16 | u16 | segment length, DDA ticks |
 | 18 | u16 | replies dropped: both transmit buffers were still in use |
 | 20 | u16 | underruns: a segment wasn't ready when the previous one ended (motors briefly ran dry) |
-| 22 | u16 | reserved, 0 |
+| 22 | u16 | frame handling part of the exec interrupt, max, µs |
+| 24 | u16 | segment computation part, max, µs |
+| 26 | u16 | most frames handled in one pass |
+| 28 | u32 | segment number of the slowest pass |
 
 ### 0x91 FEEDBACK (board -> host), 40 bytes
 
