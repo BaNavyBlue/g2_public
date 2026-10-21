@@ -142,7 +142,12 @@ class Link:
         t0 = time.perf_counter()
         self.send_raw(build_frame(ftype, seq, payload))
         while True:
-            reply = self.recv()
+            try:
+                reply = self.recv()
+            except ValueError:
+                if not skip_others:
+                    raise
+                continue        # the tail of a reply cut by reset_input_buffer()
             dt = time.perf_counter() - t0
             if reply is None:
                 raise TimeoutError("no reply to type 0x%02X seq %d" % (ftype, seq))
@@ -262,7 +267,7 @@ def print_diag(link):
         raise ValueError("expected DIAG, got type 0x%02X" % rtype)
     d = struct.unpack(DIAG_FMT, p)
     print("exec max %d us (last %d)  main-loop gap max %d us  segments %d  stale %d  watchdog trips %d  "
-          "segment %d ticks (%.1f us)  replies dropped %d  underruns %d\n  exec split: frames max %d us, segment math max %d us, most frames in one pass %d, slowest pass at segment %d"
+          "segment %d ticks (%.1f us)  replies dropped %d  underruns %d\n  link interrupt max %d us, segment math max %d us, most frames per link interrupt %d, slowest exec at segment %d"
           % (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[6] * 1e6 / 61000, d[7], d[8], d[9], d[10], d[11], d[12]))
     return d
 
@@ -303,7 +308,7 @@ def cmd_stream(link, args):
     ser.timeout = 0
     period = args.period_ms / 1000.0
     t0 = next_t = time.perf_counter()
-    sent, replies, results, buf = 0, 0, {}, bytearray()
+    sent, replies, results, buf, bad = 0, 0, {}, bytearray(), 0
     last_key, send_times, lat, late = None, {}, [], 0
     while True:
         now = time.perf_counter()
@@ -323,8 +328,10 @@ def cmd_stream(link, args):
             try:
                 frame = cobs_decode(raw)
             except ValueError:
+                bad += 1
                 continue
             if len(frame) < 8 or zlib.crc32(frame[:-4]) != struct.unpack("<I", frame[-4:])[0]:
+                bad += 1
                 continue
             _, rtype, rseq = struct.unpack("<BBH", frame[:4])
             if rtype != FEEDBACK:
@@ -348,8 +355,8 @@ def cmd_stream(link, args):
     fb = request_feedback(link, DISABLE)        # at once: the watchdog would end control in 5 ms
     print("DISABLE: " + format_feedback(fb))
     lat.sort()
-    print("sent %d MOTION, %d FEEDBACK  results %s  host late %d" %
-          (sent, replies, {name(RESULTS, k): v for k, v in results.items()}, late))
+    print("sent %d MOTION, %d FEEDBACK  results %s  bad frames from board %d  host late %d" %
+          (sent, replies, {name(RESULTS, k): v for k, v in results.items()}, bad, late))
     if lat:
         print("reply latency ms: median %.2f  99%% %.2f  max %.2f" %
               (lat[len(lat) // 2] * 1e3, lat[int(len(lat) * 0.99)] * 1e3, lat[-1] * 1e3))

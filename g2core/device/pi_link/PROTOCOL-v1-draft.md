@@ -47,9 +47,20 @@ This is how Mesa stepgens and Remora work. Compared with sending target position
   - USB G-code, JSON writes and `$` settings get error 106 (`STAT_COMMAND_NOT_ACCEPTED`).
   - USB `!` (feed hold), `%` (queue flush) and ^D (job kill) start a board stop (reason 7).
     `~` (cycle start) is ignored. ^X still resets the board.
-  - Frames from the Pi are read and answered in the exec interrupt, once per segment, so a
-    slow USB reply (formatting `{"sys":n}` holds the main loop for about 5 ms) can't delay
-    them. While USB has control the main loop reads them, as in v0.
+  - Frames from the Pi are read and answered in the link interrupt (USART2, NVIC level 2).
+    The receiver time-out fires 20 bit times after each frame ends, and segment prep also
+    triggers it once per segment as a fallback. While USB has control the main loop reads
+    frames, as in v0.
+
+    | NVIC level | Job |
+    | --- | --- |
+    | 0 | step generator (61 kHz DDA) |
+    | 1 | segment prep (exec): about 75 µs per 508 µs segment |
+    | 2 | Pi link frames: about 200 µs per frame, mostly software float |
+    | 3 | USB (moved down from 0, see below) |
+    | - | main loop: can stall for hundreds of ms formatting a long USB reply (`$$`) |
+
+    Frame handling can't delay a segment, and a stalled main loop can't delay a frame.
   - All motors stay energized at full current, as during a USB job. g2core's idle-current
     reduction resumes once control is back with USB.
 - **STOPPING**: a board stop is running (see below). It then returns to USB and records
@@ -233,10 +244,10 @@ Counters reset at each ENABLE.
 | 16 | u16 | segment length, DDA ticks |
 | 18 | u16 | replies dropped: both transmit buffers were still in use |
 | 20 | u16 | underruns: a segment wasn't ready when the previous one ended (motors briefly ran dry) |
-| 22 | u16 | frame handling part of the exec interrupt, max, µs |
-| 24 | u16 | segment computation part, max, µs |
-| 26 | u16 | most frames handled in one pass |
-| 28 | u32 | segment number of the slowest pass |
+| 22 | u16 | link interrupt time, max, µs |
+| 24 | u16 | segment computation part of the exec interrupt, max, µs |
+| 26 | u16 | most frames handled in one link interrupt |
+| 28 | u32 | segment number of the slowest exec pass |
 
 ### 0x91 FEEDBACK (board -> host), 40 bytes
 
@@ -312,9 +323,7 @@ too.
 
 - Worst-case exec interrupt time below 25% of the segment (about 123 µs), with all four
   motors moving. Otherwise use the leaner prep, or 1000 µs segments.
-- The exec interrupt now also reads and answers frames, so its time includes that: still
-  below 25% of the segment. (The main loop can stall for ~5 ms on a long USB reply; that no
-  longer affects the link, which is why frame handling moved out of it.)
+- Underruns stay at zero with all four motors moving, under a `$$` flood.
 - Zero stale segments and zero receive errors over 10 minutes of 1 kHz MOTION frames.
 
 ## Decisions (2026-10-20)

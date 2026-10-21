@@ -24,9 +24,12 @@
  * USART2 is driven directly rather than through Motate::UART: Motate's DMA layer only
  * supports USART0/1 on the SAM3X, and its UART header #undefs the CMSIS USART2 macros.
  * Both directions use the USART's PDC (DMA) and are polled; the USART itself raises no
- * interrupts. While USB has control the main loop polls; while the Pi has control the exec
- * interrupt does, once per segment, so a busy main loop (a long USB reply takes ~5 ms) can't
- * delay MOTION frames.
+ * interrupts. While USB has control the main loop polls. While the Pi has control the link
+ * interrupt (USART2, NVIC level 2) does: the receiver time-out fires 20 bit times after each
+ * frame ends, and the exec interrupt also pends it once per segment as a fallback. Level 2 is
+ * below the step generator (0) and segment prep (1), so frame handling (~200 us of software
+ * float) can never delay a segment, and above USB (3) and the main loop, which can stall for
+ * hundreds of ms on a long USB reply.
  *
  * Receive: the PDC fills a ring of two halves (current + next buffer). Each pass reads
  * whatever has arrived, splits frames on 0x00, answers valid frames, and re-arms the half
@@ -109,10 +112,12 @@ bool     rx_overlong = false;
 uint8_t  tx_buf[2][MAX_ENCODED + 1];   // the PDC's current and next transmit buffers
 uint16_t tx_dropped = 0;               // replies dropped because both buffers were taken
 
-// While the Pi has control the exec interrupt reads the receive ring (every segment, whatever the
-// main loop is doing); otherwise the main loop does. Only one of them reads at a time.
+// While the Pi has control the link interrupt reads the receive ring (whatever the main loop is
+// doing); otherwise the main loop does. Only one of them reads at a time.
 volatile bool isr_reads_rx = false;
-uint16_t      frames_in_pass = 0;      // valid frames handled in the current exec pass (DIAG)
+uint16_t      frames_in_pass = 0;      // valid frames handled in the current link interrupt (DIAG)
+void          rx_irq_enable();
+void          rx_irq_disable();
 
 struct {
     uint16_t ok;
@@ -546,6 +551,7 @@ void release_to_usb() {
     stop_done    = false;
     owner        = OWNER_USB;
     isr_reads_rx = false;       // the segment chain has ended, so the main loop can read again
+    rx_irq_disable();
     sr_request_status_report(SR_REQUEST_IMMEDIATE);
 }
 
@@ -923,8 +929,25 @@ void handle_byte(uint8_t c) {
     rx_overlong = false;
 }
 
+constexpr uint32_t RX_TIMEOUT_BITS = 20;   // line idle this long after a character: the frame is in
+
+void rx_irq_enable() {
+    usart2->US_RTOR = US_RTOR_TO(RX_TIMEOUT_BITS);
+    usart2->US_CR   = US_CR_STTTO;          // counts from the next character received
+    NVIC_SetPriority(USART2_IRQn, 2);       // below the step generator (0) and segment prep (1)
+    NVIC_ClearPendingIRQ(USART2_IRQn);
+    usart2->US_IER = US_IER_TIMEOUT;
+    NVIC_EnableIRQ(USART2_IRQn);
+}
+
+void rx_irq_disable() {
+    usart2->US_IDR = US_IDR_TIMEOUT;
+    NVIC_DisableIRQ(USART2_IRQn);
+    NVIC_ClearPendingIRQ(USART2_IRQn);
+}
+
 // Read and answer whatever has arrived. Called by the main loop while USB has control, and by
-// the exec interrupt while the Pi has control (see isr_reads_rx).
+// the link interrupt while the Pi has control (see isr_reads_rx).
 void rx_service() {
     if (usart2->US_CSR & (US_CSR_OVRE | US_CSR_FRAME)) {
         usart2->US_CR = US_CR_RSTSTA;  // line errors; the CRC catches any damaged frame
@@ -961,6 +984,26 @@ void rx_service() {
 
 }  // namespace
 
+// Link interrupt (see the top of the file). Runs only while the Pi has control.
+extern "C" void USART2_Handler() {
+    if (usart2->US_CSR & US_CSR_TIMEOUT) {
+        usart2->US_CR = US_CR_STTTO;        // clear, and wait for the next frame
+    }
+    if (!isr_reads_rx) {
+        return;
+    }
+    const uint32_t t0 = board_us();
+    frames_in_pass    = 0;
+    rx_service();
+    const uint32_t dt = board_us() - t0;
+    if (dt > diag.rx_max_us) {
+        diag.rx_max_us = (uint16_t)dt;
+    }
+    if (frames_in_pass > diag.frames_max) {
+        diag.frames_max = frames_in_pass;
+    }
+}
+
 void pi_link_init() {
     hw_init(PI_LINK_BAUD);
 }
@@ -980,7 +1023,8 @@ stat_t pi_link_periodic() {
     if (!isr_reads_rx) {
         rx_service();
         if (owner != OWNER_USB) {
-            isr_reads_rx = true;    // hand the receive ring to the exec interrupt
+            isr_reads_rx = true;    // hand the receive ring to the link interrupt
+            rx_irq_enable();
         }
     }
     motion_periodic();
@@ -999,15 +1043,7 @@ stat_t pi_link_exec_move() {
     const uint32_t t0 = board_us();
     last_exec_us      = t0;
     if (isr_reads_rx) {
-        frames_in_pass = 0;
-        rx_service();           // take in the newest MOTION before preparing the segment
-        const uint32_t rx_us = board_us() - t0;
-        if (rx_us > diag.rx_max_us) {
-            diag.rx_max_us = (uint16_t)rx_us;
-        }
-        if (frames_in_pass > diag.frames_max) {
-            diag.frames_max = frames_in_pass;
-        }
+        NVIC_SetPendingIRQ(USART2_IRQn);    // fallback: serve the link once per segment as well
     }
     if (stop_done) {
         return (STAT_NOOP);     // the final zero segment is queued; the main loop hands back to USB
