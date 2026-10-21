@@ -4,7 +4,13 @@ Status:
 - **Done:** the bench build. It has the control handshake, watchdog, board stop, USB
   read-only mode and diagnostics. Built without `PI_LINK_MOTION=1`, it holds every motor at
   zero velocity, so it can't move the machine.
-- **Not done:** motion, and spindle control over the link.
+- **Bench results (board 2, 2026-10-21):** all no-motion checks pass.
+  - The 10-minute soak: 599,998 FEEDBACKs, 0 underruns in 1.18 M segments, exec max 77 µs.
+  - USB flood, watchdog, USB stop, E-stop and recovery over the link.
+  - USB golden transcript and fuzz tests.
+- **Simulation:** `sim/run.sh` passes for the motion path.
+- **Motion build** (`PI_LINK_MOTION=1`): built, not yet run on the machine.
+- **Not done:** spindle control over the link, and the door hold.
 
 v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
 version stays 0 until v1 ships.
