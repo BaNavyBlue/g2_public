@@ -23,13 +23,15 @@
  *
  * USART2 is driven directly rather than through Motate::UART: Motate's DMA layer only
  * supports USART0/1 on the SAM3X, and its UART header #undefs the CMSIS USART2 macros.
- * Both directions use the USART's PDC (DMA) and are polled from pi_link_periodic(); no
- * interrupts are enabled, so nothing here can preempt the step generator.
+ * Both directions use the USART's PDC (DMA) and are polled; the USART itself raises no
+ * interrupts. While USB has control the main loop polls; while the Pi has control the exec
+ * interrupt does, once per segment, so a busy main loop (a long USB reply takes ~5 ms) can't
+ * delay MOTION frames.
  *
  * Receive: the PDC fills a ring of two halves (current + next buffer). Each pass reads
  * whatever has arrived, splits frames on 0x00, answers valid frames, and re-arms the half
- * that has been fully read. Transmit: one reply at a time; a reply is skipped if the
- * previous one is still being sent, which cannot happen while the host waits for replies.
+ * that has been fully read. Transmit: two buffers (the PDC's current and next); a reply is
+ * dropped, and counted, only if both are still in use.
  */
 
 #include "g2core.h"
@@ -104,7 +106,12 @@ uint8_t  rx_encoded[MAX_ENCODED];
 uint16_t rx_len      = 0;
 bool     rx_overlong = false;
 
-uint8_t  tx_buf[MAX_ENCODED + 1];
+uint8_t  tx_buf[2][MAX_ENCODED + 1];   // the PDC's current and next transmit buffers
+uint16_t tx_dropped = 0;               // replies dropped because both buffers were taken
+
+// While the Pi has control the exec interrupt reads the receive ring (every segment, whatever the
+// main loop is doing); otherwise the main loop does. Only one of them reads at a time.
+volatile bool isr_reads_rx = false;
 
 struct {
     uint16_t ok;
@@ -258,20 +265,39 @@ void rx_rearm() {
     }
 }
 
-bool tx_idle() {
-    return (usart2_pdc->PERIPH_TCR == 0) && (usart2_pdc->PERIPH_TNCR == 0);
-}
-
-void tx_start(uint16_t len) {
+// Queue an encoded frame as the PDC's current transfer, or as its next one if a frame is still
+// going out. Transmit DMA is paused for the few cycles this takes, so the PDC can't finish a
+// buffer between the checks and the queuing.
+void tx_queue(const uint8_t *encoded, uint16_t len) {
+    usart2_pdc->PERIPH_PTCR = PERIPH_PTCR_TXTDIS;
+    const bool busy = (usart2_pdc->PERIPH_TCR != 0);
+    if (busy && (usart2_pdc->PERIPH_TNCR != 0)) {
+        usart2_pdc->PERIPH_PTCR = PERIPH_PTCR_TXTEN;
+        tx_dropped++;
+        return;
+    }
+    uint8_t b = 0;
+    if (busy) {     // use the buffer the current transfer is not in
+        const uint32_t tpr = usart2_pdc->PERIPH_TPR;
+        const uint32_t b0  = (uint32_t)(uintptr_t)tx_buf[0];
+        b = ((tpr >= b0) && (tpr <= (b0 + sizeof(tx_buf[0])))) ? 1 : 0;
+    }
+    memcpy(tx_buf[b], encoded, len);
     __asm__ volatile("dmb" ::: "memory");  // tx_buf is in memory before the PDC reads it
-    usart2_pdc->PERIPH_TPR = (uint32_t)(uintptr_t)tx_buf;
-    usart2_pdc->PERIPH_TCR = len;
+    if (busy) {
+        usart2_pdc->PERIPH_TNPR = (uint32_t)(uintptr_t)tx_buf[b];
+        usart2_pdc->PERIPH_TNCR = len;
+    } else {
+        usart2_pdc->PERIPH_TPR = (uint32_t)(uintptr_t)tx_buf[b];
+        usart2_pdc->PERIPH_TCR = len;
+    }
+    usart2_pdc->PERIPH_PTCR = PERIPH_PTCR_TXTEN;
 }
 
 // ---- protocol ----
 
 void send_frame(uint8_t type, uint16_t seq, const uint8_t *payload, uint16_t payload_len) {
-    if (!tx_idle() || (payload_len > MAX_FRAME - 8)) {
+    if (payload_len > MAX_FRAME - 8) {
         return;
     }
     uint8_t frame[MAX_FRAME];
@@ -283,9 +309,10 @@ void send_frame(uint8_t type, uint16_t seq, const uint8_t *payload, uint16_t pay
     }
     put32(frame + 4 + payload_len, crc32(frame, 4 + payload_len));
 
-    uint16_t len  = cobs_encode(frame, 8 + payload_len, tx_buf);
-    tx_buf[len++] = 0;
-    tx_start(len);
+    uint8_t  encoded[MAX_ENCODED + 1];
+    uint16_t len   = cobs_encode(frame, 8 + payload_len, encoded);
+    encoded[len++] = 0;
+    tx_queue(encoded, len);
 }
 
 void send_nak(uint16_t seq, uint8_t reason, uint8_t type) {
@@ -510,8 +537,9 @@ void release_to_usb() {
     __set_PRIMASK(primask);
 
     sync_positions(true);
-    stop_done = false;
-    owner     = OWNER_USB;
+    stop_done    = false;
+    owner        = OWNER_USB;
+    isr_reads_rx = false;       // the segment chain has ended, so the main loop can read again
     sr_request_status_report(SR_REQUEST_IMMEDIATE);
 }
 
@@ -587,6 +615,7 @@ void send_diag(uint16_t seq) {
     put16(p + 12, diag.stale_segments);
     put16(p + 14, diag.watchdog_trips);
     put16(p + 16, link_cfg.seg_ticks);
+    put16(p + 18, tx_dropped);
     send_frame(TYPE_DIAG, seq, p, sizeof(p));
 }
 
@@ -877,7 +906,9 @@ void handle_byte(uint8_t c) {
     rx_overlong = false;
 }
 
-void rx_poll() {
+// Read and answer whatever has arrived. Called by the main loop while USB has control, and by
+// the exec interrupt while the Pi has control (see isr_reads_rx).
+void rx_service() {
     if (usart2->US_CSR & (US_CSR_OVRE | US_CSR_FRAME)) {
         usart2->US_CR = US_CR_RSTSTA;  // line errors; the CRC catches any damaged frame
     }
@@ -903,6 +934,9 @@ void rx_poll() {
         if (rx_read % RX_HALF == 0) {
             rx_rearm();     // a half was just finished; let the PDC have it back
         }
+        if (!isr_reads_rx && (owner != OWNER_USB)) {
+            break;          // ENABLE was just accepted: the exec interrupt reads from here on
+        }
         w = rx_write_index();
     }
     rx_rearm();
@@ -915,7 +949,12 @@ void pi_link_init() {
 }
 
 stat_t pi_link_periodic() {
-    rx_poll();
+    if (!isr_reads_rx) {
+        rx_service();
+        if (owner != OWNER_USB) {
+            isr_reads_rx = true;    // hand the receive ring to the exec interrupt
+        }
+    }
     motion_periodic();
     return (STAT_OK);
 }
@@ -931,6 +970,9 @@ void pi_link_usb_stop() {
 stat_t pi_link_exec_move() {
     const uint32_t t0 = board_us();
     last_exec_us      = t0;
+    if (isr_reads_rx) {
+        rx_service();           // take in the newest MOTION before preparing the segment
+    }
     if (stop_done) {
         return (STAT_NOOP);     // the final zero segment is queued; the main loop hands back to USB
     }

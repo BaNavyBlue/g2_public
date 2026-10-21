@@ -29,7 +29,7 @@ PING, STATUS_REQ, PONG, STATUS, NAK = 0x01, 0x02, 0x81, 0x82, 0xFF
 DIAG_REQ, ENABLE, MOTION, DISABLE, SAFETY, DIAG, FEEDBACK = 0x03, 0x10, 0x11, 0x12, 0x13, 0x83, 0x91
 STATUS_FMT = "<BBBBHBxf4fIHHHH"
 FEEDBACK_FMT = "<BBBBI4iHHBBHBBxxf"
-DIAG_FMT = "<HHIIHHHxx"
+DIAG_FMT = "<HHIIHHHH"
 STATES = ["initializing", "ready", "alarm", "program stop", "program end", "run", "hold",
           "probe", "cycle", "homing", "jog", "interlock", "shutdown", "panic"]
 OWNERS = ["USB", "PI", "STOPPING"]
@@ -135,18 +135,21 @@ class Link:
             raise ValueError("version %d" % version)
         return ftype, seq, frame[4:-4]
 
-    def request(self, ftype, payload=b""):
+    def request(self, ftype, payload=b"", skip_others=False):
+        """skip_others: drop replies to earlier frames (e.g. MOTION still in flight) until ours."""
         seq = self.next_seq()
         self.ser.reset_input_buffer()
         t0 = time.perf_counter()
         self.send_raw(build_frame(ftype, seq, payload))
-        reply = self.recv()
-        dt = time.perf_counter() - t0
-        if reply is None:
-            raise TimeoutError("no reply to type 0x%02X seq %d" % (ftype, seq))
-        if reply[1] != seq:
-            raise ValueError("seq %d, expected %d" % (reply[1], seq))
-        return reply, dt
+        while True:
+            reply = self.recv()
+            dt = time.perf_counter() - t0
+            if reply is None:
+                raise TimeoutError("no reply to type 0x%02X seq %d" % (ftype, seq))
+            if reply[1] == seq:
+                return reply, dt
+            if not skip_others or dt > self.timeout_s:
+                raise ValueError("seq %d, expected %d" % (reply[1], seq))
 
     def status(self):
         (ftype, _, payload), _ = self.request(STATUS_REQ)
@@ -247,7 +250,7 @@ def cmd_errors(link, args):
 
 
 def request_feedback(link, ftype, payload=b""):
-    (rtype, _, p), _ = link.request(ftype, payload)
+    (rtype, _, p), _ = link.request(ftype, payload, skip_others=True)
     if rtype != FEEDBACK or len(p) != 40:
         raise ValueError("expected FEEDBACK, got type 0x%02X, %d bytes" % (rtype, len(p)))
     return decode_feedback(p)
@@ -259,7 +262,7 @@ def print_diag(link):
         raise ValueError("expected DIAG, got type 0x%02X" % rtype)
     d = struct.unpack(DIAG_FMT, p)
     print("exec max %d us (last %d)  main-loop gap max %d us  segments %d  stale %d  watchdog trips %d  "
-          "segment %d ticks (%.1f us)" % (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[6] * 1e6 / 61000))
+          "segment %d ticks (%.1f us)  replies dropped %d" % (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[6] * 1e6 / 61000, d[7]))
     return d
 
 
@@ -341,9 +344,7 @@ def cmd_stream(link, args):
         while time.perf_counter() < next_t:
             pass
     ser.timeout = link.timeout_s
-    time.sleep(0.01)
-    ser.reset_input_buffer()
-    fb = request_feedback(link, DISABLE)
+    fb = request_feedback(link, DISABLE)        # at once: the watchdog would end control in 5 ms
     print("DISABLE: " + format_feedback(fb))
     lat.sort()
     print("sent %d MOTION, %d FEEDBACK  results %s  host late %d" %

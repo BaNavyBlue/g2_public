@@ -47,6 +47,9 @@ This is how Mesa stepgens and Remora work. Compared with sending target position
   - USB G-code, JSON writes and `$` settings get error 106 (`STAT_COMMAND_NOT_ACCEPTED`).
   - USB `!` (feed hold), `%` (queue flush) and ^D (job kill) start a board stop (reason 7).
     `~` (cycle start) is ignored. ^X still resets the board.
+  - Frames from the Pi are read and answered in the exec interrupt, once per segment, so a
+    slow USB reply (formatting `{"sys":n}` holds the main loop for about 5 ms) can't delay
+    them. While USB has control the main loop reads them, as in v0.
   - All motors stay energized at full current, as during a USB job. g2core's idle-current
     reduction resumes once control is back with USB.
 - **STOPPING**: a board stop is running (see below). It then returns to USB and records
@@ -228,7 +231,7 @@ Counters reset at each ENABLE.
 | 12 | u16 | stale segments |
 | 14 | u16 | watchdog trips (since power-up) |
 | 16 | u16 | segment length, DDA ticks |
-| 18 | u16 | reserved, 0 |
+| 18 | u16 | replies dropped: both transmit buffers were still in use |
 
 ### 0x91 FEEDBACK (board -> host), 40 bytes
 
@@ -296,9 +299,9 @@ A build without `PI_LINK` is unchanged: same size, same behaviour.
 
 - Worst-case exec interrupt time below 25% of the segment (about 123 µs), with all four
   motors moving. Otherwise use the leaner prep, or 1000 µs segments.
-- Longest main-loop gap while the Pi has control below 2 ms. Frames are handled in the main
-  loop, so a longer stall could trip the watchdog. Otherwise move MOTION handling into the
-  exec interrupt.
+- The exec interrupt now also reads and answers frames, so its time includes that: still
+  below 25% of the segment. (The main loop can stall for ~5 ms on a long USB reply; that no
+  longer affects the link, which is why frame handling moved out of it.)
 - Zero stale segments and zero receive errors over 10 minutes of 1 kHz MOTION frames.
 
 ## Decisions (2026-10-20)
