@@ -86,10 +86,23 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
     `hold_request` in FEEDBACK.
   - The host should pause (LinuxCNC feed hold), so the machine decelerates along its path
     and can resume.
-  - If any velocity is still non-zero `hold_timeout_ms` after the door opened, the board
-    stops on its own (reason 4).
+  - If the motors have not all reached zero velocity within `hold_timeout_ms` of the door
+    opening, the board stops on its own (reason 4).
+  - Once they have, the hold is satisfied and `hold_request` clears. Motion with the door
+    open is then allowed again, as in stock firmware with the spindle off. That allows a Z
+    lift off the work.
   - The spindle can't restart until the door is closed and the ESC has rebooted (5 s), as
     in stock firmware.
+- **Lift and resume rules belong to the LinuxCNC config, not the board.**
+  - Lift: after the hold, raise Z by a few mm with an external offset on Z (or QtDragon's
+    built-in spindle-lift pause). Returning to the paused point removes the offset.
+  - Resume: wire "door closed AND ESC ready AND spindle at speed" (from FEEDBACK `safe` and
+    actual spindle speed) into `motion.feed-inhibit`.
+  - LinuxCNC's own wait for spindle-at-speed only covers the first feed move after a speed
+    change, so it doesn't reliably cover a resume.
+  - Stock g2core can do the same on the USB path: `zl` (lift on feedhold) followed by the
+    spindle spin-up delay on resume. The Desktop CNC settings ship `zl` = 0, i.e. no lift;
+    the Othermill used -1, i.e. go to Z max.
 
 ## Timing
 
