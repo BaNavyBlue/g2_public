@@ -549,6 +549,9 @@ void st_prep_out_of_band_dwell(float milliseconds);
 stat_t st_prep_line(const float start_velocity, const float end_velocity, const float travel_steps[], const float following_error[], const float segment_time)  HOT_FUNC;
 // NOTE: this version is the same, except it's passed an array of start/end velocities, one pair per motor
 stat_t st_prep_line(const float start_velocities[], const float end_velocities[], const float travel_steps[], const float following_error[], const float segment_time)  HOT_FUNC;
+#ifdef PI_LINK
+stat_t st_prep_velocity_segment(const float v0[], const float v1[], const uint16_t ticks)  HOT_FUNC;
+#endif
 
 stat_t st_get_ma(nvObj_t *nv);
 stat_t st_set_ma(nvObj_t *nv);

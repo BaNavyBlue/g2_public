@@ -400,7 +400,6 @@ struct {
     uint16_t hold_timeout_ms;   // used once spindle control is in (door hold)
     uint16_t seg_ticks;
     float    seg_s;             // segment length in whole DDA ticks, seconds
-    float    seg_min;           // the same as st_prep_line()'s segment_time, minutes
     float    max_vel[PI_MOTORS];
     float    stop_decel[PI_MOTORS];
 } link_cfg;
@@ -424,6 +423,11 @@ struct {
 uint32_t          last_periodic_us = 0;
 volatile uint32_t last_exec_us     = 0;
 uint32_t          last_sync_us     = 0;
+
+// Signed: the exec interrupt can stamp a time after the main loop read the clock
+int32_t us_since(uint32_t then, uint32_t now) {
+    return (int32_t)(now - then);
+}
 
 // Microseconds since boot, from SysTick (1 ms ticks plus the count within the tick). Wraps after
 // about 71 minutes. Safe from interrupts and from the main loop.
@@ -641,10 +645,10 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
     }
     link_cfg.watchdog_us     = get16(p + 0) * 1000UL;
     link_cfg.hold_timeout_ms = get16(p + 4);
-    // Whole DDA ticks: 500 us is 30 ticks at 61 kHz (492 us). Steps are computed for the real length.
+    // Whole DDA ticks: 500 us is 31 ticks at 61 kHz (508 us). Rates are per second, so the
+    // rounding changes segment length, not speed.
     link_cfg.seg_ticks = (uint16_t)((get16(p + 2) * (uint32_t)FREQUENCY_DDA + 500000UL) / 1000000UL);
     link_cfg.seg_s     = (float)link_cfg.seg_ticks / FREQUENCY_DDA;
-    link_cfg.seg_min   = ((float)link_cfg.seg_ticks + 0.5f) / (60.0f * FREQUENCY_DDA);  // +0.5 so the tick count truncates right
     for (uint8_t m = 0; m < PI_MOTORS; m++) {
         link_cfg.max_vel[m]    = getf(p + 8 + 4 * m);
         link_cfg.stop_decel[m] = getf(p + 24 + 4 * m);
@@ -774,7 +778,7 @@ void motion_periodic() {
     }
 
     // Something reset the steppers (a g2core halt) and the segment chain stopped: hand back now
-    if ((now - last_exec_us) > EXEC_LOST_US) {
+    if (us_since(last_exec_us, now) > (int32_t)EXEC_LOST_US) {
         if (owner == OWNER_PI) {
             release_reason = REASON_FAULT;
         }
@@ -786,7 +790,7 @@ void motion_periodic() {
         return;
     }
 
-    if ((now - last_sync_us) > SYNC_PERIOD_US) {
+    if (us_since(last_sync_us, now) > (int32_t)SYNC_PERIOD_US) {
         last_sync_us = now;
         sync_positions(false);
     }
@@ -934,7 +938,7 @@ stat_t pi_link_exec_move() {
     const MotionCommand &c = cmd[cmd_live];
     if (owner == OWNER_PI) {
         uint8_t reason = stop_request;
-        if ((reason == REASON_NONE) && ((t0 - c.rx_us) > link_cfg.watchdog_us)) {
+        if ((reason == REASON_NONE) && (us_since(c.rx_us, t0) > (int32_t)link_cfg.watchdog_us)) {
             reason = REASON_WATCHDOG;
             diag.watchdog_trips++;
         }
@@ -949,7 +953,7 @@ stat_t pi_link_exec_move() {
             v1[m] = c.vel[m];
         }
         queued_seq = c.seq;
-        if ((t0 - c.rx_us) > STALE_US) {
+        if (us_since(c.rx_us, t0) > (int32_t)STALE_US) {
             diag.stale_segments++;
             fb_stale = true;
         }
@@ -961,35 +965,27 @@ stat_t pi_link_exec_move() {
         }
     }
 
-    float start[MOTORS] = {};
-    float end[MOTORS]   = {};
-    float steps[MOTORS] = {};
-    float ferr[MOTORS]  = {};
-    bool  moving        = false;
+    // Each motor ramps linearly from the previous segment's end rate to the new one
+    float from[MOTORS] = {};
+    float to[MOTORS]   = {};
+    bool  moving       = false;
     for (uint8_t m = 0; m < PI_MOTORS; m++) {
         const float v0 = v_prev[m];
         const float vv = v1[m];
         if (((v0 > 0) && (vv < 0)) || ((v0 < 0) && (vv > 0))) {
-            // the DDA can't reverse within a segment: run this one at the average velocity
-            const float avg = 0.5f * (v0 + vv);
-            steps[m] = avg * link_cfg.seg_s;
-            start[m] = fabsf(avg);
-            end[m]   = start[m];
+            // the DDA can't reverse within a segment: run this one at the average rate
+            from[m] = 0.5f * (v0 + vv);
+            to[m]   = from[m];
         } else {
-            steps[m] = 0.5f * (v0 + vv) * link_cfg.seg_s;
-            start[m] = fabsf(v0);
-            end[m]   = fabsf(vv);
-            // a zero starting rate reads as "motor idle" to the loader, which would drop the steps
-            if (start[m] < (end[m] * 1e-6f)) {
-                start[m] = end[m] * 1e-6f;
-            }
+            from[m] = v0;
+            to[m]   = vv;
         }
         if ((fabsf(v0) > 0) || (fabsf(vv) > 0)) {
             moving = true;
         }
         v_prev[m] = vv;
     }
-    st_prep_line(start, end, steps, ferr, link_cfg.seg_min);
+    st_prep_velocity_segment(from, to, link_cfg.seg_ticks);
     diag.segments++;
     if ((owner == OWNER_STOPPING) && !moving) {
         stop_done = true;       // this all-zero segment folds the last steps into the step counters

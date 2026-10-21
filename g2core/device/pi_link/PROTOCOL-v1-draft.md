@@ -130,7 +130,7 @@ Not in the bench build: it needs spindle control over the link.
 ## Timing
 
 - The board runs segments of `segment_us` (default 500 µs) on its own clock.
-  - Segments are whole DDA ticks: 500 µs becomes 30 ticks at 61 kHz, which is 492 µs.
+  - Segments are whole DDA ticks: 500 µs becomes 31 ticks at 61 kHz, which is 508 µs.
     Steps are computed for that real length, so velocities stay exact.
   - With 1 ms frames, each command covers about two segments: the first ramps to the new
     velocity, the second holds it.
@@ -145,7 +145,7 @@ Not in the bench build: it needs spindle control over the link.
     g2core's loader treat the motor as idle and drop the segment's steps.
 - g2core prepares the next segment while the current one runs, so a command reaches the
   motors 1 to 2 segments (0.5-1 ms) after it arrives. The driver's feedback loop absorbs this.
-- Segment prep runs in g2core's exec interrupt. `st_prep_line()` uses software doubles
+- Segment prep runs in g2core's exec interrupt. g2core's `st_prep_line()` uses software doubles
   (the Cortex-M3 has no FPU): roughly 20-30 µs per moving motor, so about 100 µs of each
   500 µs segment at worst. Since the velocities already arrive in steps/s, a leaner prep
   for this path (two multiplies per motor) can replace it if the measurement says so.

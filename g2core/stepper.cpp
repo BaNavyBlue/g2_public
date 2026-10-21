@@ -868,6 +868,52 @@ stat_t st_prep_line(const float start_velocities[], const float end_velocities[]
     st_pre.buffer_state = PREP_BUFFER_OWNED_BY_LOADER;    // signal that prep buffer is ready
     return (STAT_OK);
 }
+#ifdef PI_LINK
+/*
+ * st_prep_velocity_segment() - prepare a segment of `ticks` DDA ticks in which each motor's step
+ *  rate ramps linearly from v0[] to v1[] (steps/s; both the same sign, or zero). Same result as
+ *  st_prep_line() for this case, but with two float multiplies per motor instead of its double
+ *  precision math, so the Pi link's 500 us segments fit the exec interrupt's budget.
+ *
+ *  The DDA adds substep_increment to a motor's accumulator every tick and steps on overflow of
+ *  DDA_SUBSTEPS, so a rate of v steps/s is v * DDA_SUBSTEPS / FREQUENCY_DDA per tick.
+ */
+stat_t st_prep_velocity_segment(const float v0[], const float v1[], const uint16_t ticks)
+{
+    if (st_pre.buffer_state != PREP_BUFFER_OWNED_BY_EXEC) {     // never supposed to happen
+        return (cm_panic(STAT_INTERNAL_ERROR, "st_prep_velocity_segment() prep sync error"));
+    }
+    st_pre.dda_ticks = ticks;
+
+    const float per_rate = (float)DDA_SUBSTEPS / FREQUENCY_DDA; // increment for 1 step/s
+    const float per_ramp = per_rate / (float)(ticks - 1);       // increment_increment for 1 step/s of change
+
+    for (uint8_t motor = 0; motor < MOTORS; motor++) {
+        const float a = std::abs(v0[motor]);
+        const float b = std::abs(v1[motor]);
+        if ((a + b) < 0.001f) {                                 // not moving this segment
+            st_pre.mot[motor].substep_increment = 0;            // substep increment also acts as a motor flag
+            continue;
+        }
+        if ((v0[motor] + v1[motor]) >= 0) {
+            st_pre.mot[motor].direction = DIRECTION_CW ^ st_cfg.mot[motor].polarity;
+            st_pre.mot[motor].step_sign = 1;
+        } else {
+            st_pre.mot[motor].direction = DIRECTION_CCW ^ st_cfg.mot[motor].polarity;
+            st_pre.mot[motor].step_sign = -1;
+        }
+        // A zero starting increment would read as an idle motor to the loader, so start at 1
+        const int64_t increment = (int64_t)(a * per_rate);
+        st_pre.mot[motor].substep_increment           = (increment > 0) ? increment : 1;
+        st_pre.mot[motor].substep_increment_increment = (int64_t)((b - a) * per_ramp);
+    }
+    st_pre.block_type = BLOCK_TYPE_ALINE;
+    st_pre.bf = nullptr;
+    st_pre.buffer_state = PREP_BUFFER_OWNED_BY_LOADER;    // signal that prep buffer is ready
+    return (STAT_OK);
+}
+#endif
+
 /*
  * st_prep_null() - Keeps the loader happy. Otherwise performs no action
  */
