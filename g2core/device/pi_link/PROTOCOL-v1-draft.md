@@ -218,7 +218,7 @@ reply is result 0.
 1 = acknowledge E-stop (as `{"estpc":n}`), 2 = clear alarm or shutdown (as `{"clear":n}`).
 Only accepted while USB has control (result 6 otherwise).
 
-### 0x03 DIAG_REQ (host -> board), no payload; reply 0x83 DIAG, 20 bytes
+### 0x03 DIAG_REQ (host -> board), no payload; reply 0x83 DIAG, 24 bytes
 
 Counters reset at each ENABLE.
 
@@ -232,6 +232,8 @@ Counters reset at each ENABLE.
 | 14 | u16 | watchdog trips (since power-up) |
 | 16 | u16 | segment length, DDA ticks |
 | 18 | u16 | replies dropped: both transmit buffers were still in use |
+| 20 | u16 | underruns: a segment wasn't ready when the previous one ended (motors briefly ran dry) |
+| 22 | u16 | reserved, 0 |
 
 ### 0x91 FEEDBACK (board -> host), 40 bytes
 
@@ -275,6 +277,14 @@ Counters reset at each ENABLE.
 | `device/pi_link/pi_link.cpp` | Everything else. |
 
 A build without `PI_LINK` is unchanged: same size, same behaviour.
+
+**USB interrupt priority (PI_LINK builds).** Motate's SAM3X USB driver passes the flag
+`kInterruptPriorityLow` (1<<8) to `NVIC_SetPriority()`. Only 4 bits are kept, so USB runs
+at level 0: the highest, shared with the step generator and above segment prep. A `$$` flood
+stretched one segment prep to 390 µs. One second after boot, the link moves USB to level 3, as
+intended: below the step generator (0), segment prep (1) and forward planning (2). Stock
+builds are left as they are; the same fix would likely cut step jitter during USB traffic there
+too.
 
 ## Test plan
 

@@ -29,7 +29,7 @@ PING, STATUS_REQ, PONG, STATUS, NAK = 0x01, 0x02, 0x81, 0x82, 0xFF
 DIAG_REQ, ENABLE, MOTION, DISABLE, SAFETY, DIAG, FEEDBACK = 0x03, 0x10, 0x11, 0x12, 0x13, 0x83, 0x91
 STATUS_FMT = "<BBBBHBxf4fIHHHH"
 FEEDBACK_FMT = "<BBBBI4iHHBBHBBxxf"
-DIAG_FMT = "<HHIIHHHH"
+DIAG_FMT = "<HHIIHHHHHxx"
 STATES = ["initializing", "ready", "alarm", "program stop", "program end", "run", "hold",
           "probe", "cycle", "homing", "jog", "interlock", "shutdown", "panic"]
 OWNERS = ["USB", "PI", "STOPPING"]
@@ -258,11 +258,11 @@ def request_feedback(link, ftype, payload=b""):
 
 def print_diag(link):
     (rtype, _, p), _ = link.request(DIAG_REQ)
-    if rtype != DIAG or len(p) != 20:
+    if rtype != DIAG or len(p) != 24:
         raise ValueError("expected DIAG, got type 0x%02X" % rtype)
     d = struct.unpack(DIAG_FMT, p)
     print("exec max %d us (last %d)  main-loop gap max %d us  segments %d  stale %d  watchdog trips %d  "
-          "segment %d ticks (%.1f us)  replies dropped %d" % (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[6] * 1e6 / 61000, d[7]))
+          "segment %d ticks (%.1f us)  replies dropped %d  underruns %d" % (d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[6] * 1e6 / 61000, d[7], d[8]))
     return d
 
 

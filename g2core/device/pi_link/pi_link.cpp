@@ -444,6 +444,7 @@ struct {
     volatile uint32_t segments;
     volatile uint16_t stale_segments;
     volatile uint16_t watchdog_trips;
+    volatile uint16_t underruns;
     uint32_t          loop_gap_max_us;
 } diag = {};
 
@@ -607,7 +608,7 @@ void send_feedback(uint16_t seq, uint8_t result) {
 }
 
 void send_diag(uint16_t seq) {
-    uint8_t p[20] = {};
+    uint8_t p[24] = {};
     put16(p + 0, diag.exec_max_us);
     put16(p + 2, diag.exec_last_us);
     put32(p + 4, diag.loop_gap_max_us);
@@ -616,6 +617,7 @@ void send_diag(uint16_t seq) {
     put16(p + 14, diag.watchdog_trips);
     put16(p + 16, link_cfg.seg_ticks);
     put16(p + 18, tx_dropped);
+    put16(p + 20, diag.underruns);
     send_frame(TYPE_DIAG, seq, p, sizeof(p));
 }
 
@@ -694,6 +696,7 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
     diag.exec_last_us    = 0;
     diag.segments        = 0;
     diag.stale_segments  = 0;
+    diag.underruns       = 0;
     diag.loop_gap_max_us = 0;
     queued_seq           = seq;
     release_reason       = REASON_NONE;
@@ -949,6 +952,17 @@ void pi_link_init() {
 }
 
 stat_t pi_link_periodic() {
+    // Motate's SAM3X USB driver passes kInterruptPriorityLow (a flag, 1<<8) to NVIC_SetPriority(),
+    // which keeps only 4 bits and so gets level 0: the highest, shared with the step generator
+    // and above segment prep. A burst of USB traffic then stretched segment prep to 390 us.
+    // Once USB is up, put it at level 3 as intended: below the step generator (0), segment
+    // prep (1) and forward planning (2).
+    static bool usb_priority_set = false;
+    if (!usb_priority_set && (Motate::SysTickTimer.getValue() > 1000)) {
+        NVIC_SetPriority(UOTGHS_IRQn, 3);
+        usb_priority_set = true;
+    }
+
     if (!isr_reads_rx) {
         rx_service();
         if (owner != OWNER_USB) {
@@ -1029,6 +1043,12 @@ stat_t pi_link_exec_move() {
     }
     st_prep_velocity_segment(from, to, link_cfg.seg_ticks);
     diag.segments++;
+    // The exec runs right after a load, so the steppers should still be busy with that segment. If
+    // they're idle, this one took longer than a segment and the motors briefly ran dry. (The
+    // first segment after ENABLE starts from idle by design.)
+    if ((diag.segments > 1) && !st_runtime_isbusy()) {
+        diag.underruns++;
+    }
     if ((owner == OWNER_STOPPING) && !moving) {
         stop_done = true;       // this all-zero segment folds the last steps into the step counters
     }
