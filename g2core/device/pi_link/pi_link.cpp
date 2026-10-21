@@ -15,7 +15,11 @@
  * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 /*
- * v0: echo (PING/PONG) and STATUS only - see PROTOCOL.md. Nothing here commands motion.
+ * v0: echo (PING/PONG) and STATUS - see PROTOCOL.md.
+ * v1: motion (ENABLE, MOTION, DISABLE, SAFETY, DIAG) - see PROTOCOL-v1-draft.md. While the Pi
+ * has control, g2core's exec interrupt calls pi_link_exec_move() instead of the planner, and
+ * each segment plays the newest velocity command. Without PI_LINK_MOTION every velocity is
+ * forced to zero.
  *
  * USART2 is driven directly rather than through Motate::UART: Motate's DMA layer only
  * supports USART0/1 on the SAM3X, and its UART header #undefs the CMSIS USART2 macros.
@@ -31,13 +35,19 @@
 #include "g2core.h"
 #include "config.h"
 #include "canonical_machine.h"
+#include "planner.h"
+#include "stepper.h"
+#include "encoder.h"
+#include "kinematics.h"
 #include "spindle.h"
 #include "gpio.h"
+#include "report.h"
 #include "pi_link.h"
 
 #include "MotatePins.h"
 #include "MotateTimers.h"
 
+#include <math.h>
 #include <string.h>
 
 #ifdef BANTAM
@@ -69,8 +79,15 @@ constexpr uint16_t RX_SIZE          = 2 * RX_HALF;
 enum : uint8_t {
     TYPE_PING       = 0x01,
     TYPE_STATUS_REQ = 0x02,
+    TYPE_DIAG_REQ   = 0x03,
+    TYPE_ENABLE     = 0x10,
+    TYPE_MOTION     = 0x11,
+    TYPE_DISABLE    = 0x12,
+    TYPE_SAFETY     = 0x13,
     TYPE_PONG       = 0x81,
     TYPE_STATUS     = 0x82,
+    TYPE_DIAG       = 0x83,
+    TYPE_FEEDBACK   = 0x91,
     TYPE_NAK        = 0xFF,
 };
 
@@ -313,6 +330,468 @@ void send_status(uint16_t seq) {
     send_frame(TYPE_STATUS, seq, p, sizeof(p));
 }
 
+// ---- motion (v1) ----
+
+constexpr uint8_t  PI_MOTORS         = 4;
+static_assert(MOTORS >= PI_MOTORS, "the link drives motors 1-4");
+constexpr float    DDA_MAX_STEP_RATE = 0.95f * FREQUENCY_DDA;  // the DDA makes at most one step per tick
+constexpr uint32_t STALE_US          = 2000;    // a segment is stale if the newest command is older than this
+constexpr uint32_t EXEC_LOST_US      = 20000;   // no segment prepared for this long while in control: chain lost
+constexpr uint32_t SYNC_PERIOD_US    = 10000;   // how often USB-visible positions follow the step counters
+
+enum : uint8_t {
+    OWNER_USB      = 0,
+    OWNER_PI       = 1,
+    OWNER_STOPPING = 2,
+};
+
+enum : uint8_t {    // FEEDBACK result
+    RESULT_OK             = 0,
+    RESULT_NOT_IDLE       = 1,
+    RESULT_ESTOP          = 2,
+    RESULT_ALARM          = 3,
+    RESULT_BAD_PARAM      = 4,
+    RESULT_NOT_IN_CONTROL = 5,
+    RESULT_IN_CONTROL     = 6,
+};
+
+enum : uint8_t {    // why the board ended the Pi's control
+    REASON_NONE      = 0,
+    REASON_DISABLE   = 1,
+    REASON_WATCHDOG  = 2,
+    REASON_ESTOP     = 3,
+    REASON_DOOR      = 4,
+    REASON_ALARM     = 5,
+    REASON_BAD_FRAME = 6,
+    REASON_USB_STOP  = 7,
+    REASON_FAULT     = 8,
+};
+
+enum : uint8_t {    // FEEDBACK flags
+    FB_HOLD_REQUEST  = 0x01,
+    FB_CLAMPED       = 0x02,
+    FB_STALE         = 0x04,
+    FB_MOTION_LOCKED = 0x08,
+};
+
+// The Desktop CNC maps motors 1-4 to these axes
+const uint8_t motor_axis[PI_MOTORS] = {AXIS_X, AXIS_Y, AXIS_Z, AXIS_A};
+
+struct MotionCommand {
+    float    vel[PI_MOTORS];    // steps/s, already checked and clamped
+    uint16_t seq;
+    uint32_t rx_us;             // board time it was taken in
+};
+
+// The main loop writes the copy the exec interrupt is not reading, then flips cmd_live. The
+// interrupt can't be preempted by the main loop, so it always reads a whole command.
+MotionCommand    cmd[2];
+volatile uint8_t cmd_live = 0;
+
+volatile uint8_t owner          = OWNER_USB;
+volatile uint8_t release_reason = REASON_NONE;
+volatile uint8_t stop_request   = REASON_NONE;  // main loop -> exec interrupt
+volatile bool    stop_done      = false;        // exec interrupt -> main loop: final zero segment queued
+bool             fb_clamped     = false;        // latched until the next FEEDBACK (main loop only)
+volatile bool    fb_stale       = false;        // set by the exec interrupt, cleared by the next FEEDBACK
+
+struct {
+    uint32_t watchdog_us;
+    uint16_t hold_timeout_ms;   // used once spindle control is in (door hold)
+    uint16_t seg_ticks;
+    float    seg_s;             // segment length in whole DDA ticks, seconds
+    float    seg_min;           // the same as st_prep_line()'s segment_time, minutes
+    float    max_vel[PI_MOTORS];
+    float    stop_decel[PI_MOTORS];
+} link_cfg;
+
+// exec interrupt state
+float             v_prev[PI_MOTORS];    // end velocity of the last segment prepared, steps/s
+float             stop_v0[PI_MOTORS];
+float             stop_t;
+float             stop_len;
+volatile uint16_t queued_seq = 0;       // seq of the newest MOTION taken into a segment
+
+struct {
+    volatile uint16_t exec_max_us;
+    volatile uint16_t exec_last_us;
+    volatile uint32_t segments;
+    volatile uint16_t stale_segments;
+    volatile uint16_t watchdog_trips;
+    uint32_t          loop_gap_max_us;
+} diag = {};
+
+uint32_t          last_periodic_us = 0;
+volatile uint32_t last_exec_us     = 0;
+uint32_t          last_sync_us     = 0;
+
+// Microseconds since boot, from SysTick (1 ms ticks plus the count within the tick). Wraps after
+// about 71 minutes. Safe from interrupts and from the main loop.
+uint32_t board_us() {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t ms  = Motate::SysTickTimer.getValue();
+    uint32_t val = SysTick->VAL;
+    if (SCB->ICSR & SCB_ICSR_PENDSTSET_Msk) {   // the counter wrapped but the tick interrupt hasn't run yet
+        ms++;
+        val = SysTick->VAL;
+    }
+    __set_PRIMASK(primask);
+    const uint32_t load = SysTick->LOAD + 1;    // core clocks per ms
+    return (ms * 1000) + (((load - 1 - val) * 1000) / load);
+}
+
+// Steps each motor has made so far, including the segment now running
+void read_positions(int32_t pos[MOTORS]) {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    for (uint8_t m = 0; m < MOTORS; m++) {
+        pos[m] = en.en[m].encoder_steps + en.en[m].steps_run;
+    }
+    __set_PRIMASK(primask);
+}
+
+// Point g2core's positions at where the steps say the machine is. Live (full == false) updates
+// only what USB status reports show; full also resets the planner and step bookkeeping, for
+// handing control back to USB.
+void sync_positions(bool full) {
+    int32_t pos[MOTORS];
+    read_positions(pos);
+    float steps[MOTORS];
+    for (uint8_t m = 0; m < MOTORS; m++) {
+        steps[m] = (float)pos[m];
+    }
+    float travel[AXES];
+    kn_forward_kinematics(steps, travel);
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        const uint8_t axis = motor_axis[m];
+        if (full) {
+            cm_set_position_by_axis(axis, travel[axis]);
+        } else {
+            cm->gmx.position[axis] = travel[axis];
+            mp_set_runtime_position(axis, travel[axis]);
+        }
+    }
+}
+
+// Exec interrupt only. Every motor ramps linearly to zero; all reach it together, at the time the
+// slowest one needs at its stop_decel, so the machine stops on a straight line.
+void begin_stop(uint8_t reason) {
+    owner          = OWNER_STOPPING;
+    release_reason = reason;
+    stop_request   = REASON_NONE;
+    stop_t         = 0;
+    stop_len       = 0;
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        stop_v0[m]     = v_prev[m];
+        const float t  = fabsf(v_prev[m]) / link_cfg.stop_decel[m];
+        stop_len       = (t > stop_len) ? t : stop_len;
+    }
+}
+
+void request_stop(uint8_t reason) {
+    if ((owner == OWNER_PI) && (stop_request == REASON_NONE)) {
+        stop_request = reason;
+    }
+}
+
+// Main loop only, once the board stop has finished and the steppers are idle
+void release_to_usb() {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    for (uint8_t m = 0; m < MOTORS; m++) {      // fold in any steps not yet accumulated
+        en.en[m].encoder_steps += en.en[m].steps_run;
+        en.en[m].steps_run = 0;
+    }
+    __set_PRIMASK(primask);
+
+    sync_positions(true);
+    stop_done = false;
+    owner     = OWNER_USB;
+    sr_request_status_report(SR_REQUEST_IMMEDIATE);
+}
+
+uint8_t safe_bits() {
+#ifdef BANTAM
+    if (bsm) {
+        return (bsm->get_interlock_safety_state() ? 0x1 : 0) | (bsm->get_esc_safety_state() ? 0x2 : 0);
+    }
+#endif
+    return 0;
+}
+
+uint8_t estop_bits() {
+#ifdef BANTAM
+    if (bsm) {
+        return bsm->get_estop_state();
+    }
+#endif
+    return 0;
+}
+
+bool machine_alarmed() {
+    return (cm1.machine_state == MACHINE_ALARM) || (cm1.machine_state == MACHINE_SHUTDOWN) ||
+           (cm1.machine_state == MACHINE_PANIC);
+}
+
+uint16_t input_bits() {
+    uint16_t inputs = 0;
+    for (uint8_t i = 0; i < 16; i++) {
+        if (in_r[i]->getState()) {
+            inputs |= (1 << i);
+        }
+    }
+    return inputs;
+}
+
+void send_feedback(uint16_t seq, uint8_t result) {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    const bool stale = fb_stale;
+    fb_stale         = false;
+    __set_PRIMASK(primask);
+
+    uint8_t p[40] = {};
+    p[0] = result;
+    p[1] = owner;
+    p[2] = release_reason;
+    p[3] = (fb_clamped ? FB_CLAMPED : 0) | (stale ? FB_STALE : 0) | (PI_LINK_MOTION ? 0 : FB_MOTION_LOCKED);
+    fb_clamped = false;
+    put32(p + 4, board_us());
+    int32_t pos[MOTORS];
+    read_positions(pos);
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        put32(p + 8 + 4 * m, (uint32_t)pos[m]);
+    }
+    put16(p + 24, queued_seq);
+    put16(p + 26, diag.stale_segments);
+    p[28] = safe_bits();
+    p[29] = estop_bits() & 0x3;
+    put16(p + 30, input_bits());
+    p[32] = (uint8_t)spindle_get_direction();
+    p[33] = (uint8_t)cm_get_combined_state(&cm1);
+    putf(p + 36, spindle_get_speed());
+    send_frame(TYPE_FEEDBACK, seq, p, sizeof(p));
+}
+
+void send_diag(uint16_t seq) {
+    uint8_t p[20] = {};
+    put16(p + 0, diag.exec_max_us);
+    put16(p + 2, diag.exec_last_us);
+    put32(p + 4, diag.loop_gap_max_us);
+    put32(p + 8, diag.segments);
+    put16(p + 12, diag.stale_segments);
+    put16(p + 14, diag.watchdog_trips);
+    put16(p + 16, link_cfg.seg_ticks);
+    send_frame(TYPE_DIAG, seq, p, sizeof(p));
+}
+
+float getf(const uint8_t *p) {
+    const uint32_t u = get32(p);
+    float v;
+    memcpy(&v, &u, 4);
+    return v;
+}
+
+uint16_t get16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+uint8_t enable_check(const uint8_t *p, uint16_t len) {
+    if (owner != OWNER_USB) {
+        return RESULT_IN_CONTROL;
+    }
+    if (estop_bits() != 0) {
+        return RESULT_ESTOP;
+    }
+    if (machine_alarmed()) {
+        return RESULT_ALARM;
+    }
+    const cmMachineState ms = cm1.machine_state;
+    if (((ms != MACHINE_READY) && (ms != MACHINE_PROGRAM_STOP) && (ms != MACHINE_PROGRAM_END)) ||
+        (cm1.cycle_type != CYCLE_NONE) || (cm1.hold_state != FEEDHOLD_OFF) || mp_has_runnable_buffer(mp) ||
+        !mp_runtime_is_idle() || st_runtime_isbusy() || (spindle_get_direction() != SPINDLE_OFF)) {
+        return RESULT_NOT_IDLE;
+    }
+    if (len != 52) {
+        return RESULT_BAD_PARAM;
+    }
+    const uint16_t watchdog_ms = get16(p + 0);
+    const uint16_t segment_us  = get16(p + 2);
+    const uint16_t hold_ms     = get16(p + 4);
+    if ((watchdog_ms < 2) || (watchdog_ms > 100) || (segment_us < 500) || (segment_us > 2000) || (hold_ms < 50) ||
+        (hold_ms > 2000)) {
+        return RESULT_BAD_PARAM;
+    }
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        const float vmax  = getf(p + 8 + 4 * m);
+        const float decel = getf(p + 24 + 4 * m);
+        if (!isfinite(vmax) || (vmax <= 0) || (vmax > DDA_MAX_STEP_RATE) || !isfinite(decel) || (decel <= 0)) {
+            return RESULT_BAD_PARAM;
+        }
+    }
+    return RESULT_OK;
+}
+
+void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
+    const uint8_t result = enable_check(p, len);
+    if (result != RESULT_OK) {
+        send_feedback(seq, result);
+        return;
+    }
+    link_cfg.watchdog_us     = get16(p + 0) * 1000UL;
+    link_cfg.hold_timeout_ms = get16(p + 4);
+    // Whole DDA ticks: 500 us is 30 ticks at 61 kHz (492 us). Steps are computed for the real length.
+    link_cfg.seg_ticks = (uint16_t)((get16(p + 2) * (uint32_t)FREQUENCY_DDA + 500000UL) / 1000000UL);
+    link_cfg.seg_s     = (float)link_cfg.seg_ticks / FREQUENCY_DDA;
+    link_cfg.seg_min   = ((float)link_cfg.seg_ticks + 0.5f) / (60.0f * FREQUENCY_DDA);  // +0.5 so the tick count truncates right
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        link_cfg.max_vel[m]    = getf(p + 8 + 4 * m);
+        link_cfg.stop_decel[m] = getf(p + 24 + 4 * m);
+        v_prev[m]         = 0;
+    }
+
+    const uint32_t now = board_us();
+    for (uint8_t i = 0; i < 2; i++) {
+        memset(cmd[i].vel, 0, sizeof(cmd[i].vel));
+        cmd[i].seq   = seq;
+        cmd[i].rx_us = now;     // the watchdog starts now: the first MOTION is due within watchdog_ms
+    }
+    diag.exec_max_us     = 0;
+    diag.exec_last_us    = 0;
+    diag.segments        = 0;
+    diag.stale_segments  = 0;
+    diag.loop_gap_max_us = 0;
+    queued_seq           = seq;
+    release_reason       = REASON_NONE;
+    stop_request         = REASON_NONE;
+    stop_done            = false;
+    fb_clamped           = false;
+    fb_stale             = false;
+    last_exec_us         = now;
+    last_sync_us         = now;
+
+    for (uint8_t m = 0; m < MOTORS; m++) {
+        Motors[m]->enable();    // energized for as long as the Pi has control
+    }
+    __asm__ volatile("dmb" ::: "memory");
+    owner = OWNER_PI;
+    st_request_exec_move();     // start the segment chain
+    send_feedback(seq, RESULT_OK);
+}
+
+void handle_motion(uint16_t seq, const uint8_t *p, uint16_t len) {
+    if (owner != OWNER_PI) {
+        send_feedback(seq, RESULT_NOT_IN_CONTROL);
+        return;
+    }
+    bool valid = (len == 24) && (p[16] == 0);   // no spindle control over the link yet
+    float vel[PI_MOTORS];
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        vel[m] = getf(p + 4 * m);
+        if (!isfinite(vel[m])) {
+            valid = false;
+        }
+    }
+    if (!valid) {
+        request_stop(REASON_BAD_FRAME);
+        send_feedback(seq, RESULT_BAD_PARAM);
+        return;
+    }
+
+    MotionCommand &c = cmd[cmd_live ^ 1];
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        float v = PI_LINK_MOTION ? vel[m] : 0;
+        if (v > link_cfg.max_vel[m]) {
+            v          = link_cfg.max_vel[m];
+            fb_clamped = true;
+        } else if (v < -link_cfg.max_vel[m]) {
+            v          = -link_cfg.max_vel[m];
+            fb_clamped = true;
+        }
+        c.vel[m] = v;
+    }
+    c.seq   = seq;
+    c.rx_us = board_us();
+    __asm__ volatile("dmb" ::: "memory");
+    cmd_live ^= 1;
+    send_feedback(seq, RESULT_OK);
+}
+
+void handle_disable(uint16_t seq, uint16_t len) {
+    if (len != 0) {
+        send_feedback(seq, RESULT_BAD_PARAM);
+        return;
+    }
+    if (owner != OWNER_PI) {
+        send_feedback(seq, (owner == OWNER_STOPPING) ? RESULT_OK : RESULT_NOT_IN_CONTROL);
+        return;
+    }
+    request_stop(REASON_DISABLE);
+    send_feedback(seq, RESULT_OK);
+}
+
+void handle_safety(uint16_t seq, const uint8_t *p, uint16_t len) {
+    if (owner != OWNER_USB) {
+        send_feedback(seq, RESULT_IN_CONTROL);
+        return;
+    }
+    if (len != 1) {
+        send_feedback(seq, RESULT_BAD_PARAM);
+        return;
+    }
+    if (p[0] == 1) {
+#ifdef BANTAM
+        if (bsm) {
+            bsm->ack_estop();
+        }
+#endif
+    } else if (p[0] == 2) {
+        cm_clear();
+    } else {
+        send_feedback(seq, RESULT_BAD_PARAM);
+        return;
+    }
+    send_feedback(seq, RESULT_OK);
+}
+
+// Main loop housekeeping while the Pi has control
+void motion_periodic() {
+    const uint32_t now = board_us();
+    const uint32_t gap = now - last_periodic_us;
+    last_periodic_us   = now;
+    if (owner == OWNER_USB) {
+        return;
+    }
+    if (gap > diag.loop_gap_max_us) {
+        diag.loop_gap_max_us = gap;
+    }
+
+    if (estop_bits() != 0) {
+        request_stop(REASON_ESTOP);
+    } else if (machine_alarmed()) {
+        request_stop(REASON_ALARM);
+    }
+
+    // Something reset the steppers (a g2core halt) and the segment chain stopped: hand back now
+    if ((now - last_exec_us) > EXEC_LOST_US) {
+        if (owner == OWNER_PI) {
+            release_reason = REASON_FAULT;
+        }
+        stop_done = true;
+    }
+
+    if (stop_done && !st_runtime_isbusy()) {
+        release_to_usb();
+        return;
+    }
+
+    if ((now - last_sync_us) > SYNC_PERIOD_US) {
+        last_sync_us = now;
+        sync_positions(false);
+    }
+}
+
 void handle_frame(const uint8_t *f, uint16_t len) {
     if ((len < 8) || (f[0] != PROTOCOL_VERSION)) {
         counters.framing++;
@@ -343,6 +822,25 @@ void handle_frame(const uint8_t *f, uint16_t len) {
             } else {
                 send_status(seq);
             }
+            break;
+        case TYPE_DIAG_REQ:
+            if (payload_len != 0) {
+                send_nak(seq, NAK_BAD_LENGTH, type);
+            } else {
+                send_diag(seq);
+            }
+            break;
+        case TYPE_ENABLE:
+            handle_enable(seq, payload, payload_len);
+            break;
+        case TYPE_MOTION:
+            handle_motion(seq, payload, payload_len);
+            break;
+        case TYPE_DISABLE:
+            handle_disable(seq, payload_len);
+            break;
+        case TYPE_SAFETY:
+            handle_safety(seq, payload, payload_len);
             break;
         default:
             send_nak(seq, NAK_UNKNOWN_TYPE, type);
@@ -375,13 +873,7 @@ void handle_byte(uint8_t c) {
     rx_overlong = false;
 }
 
-}  // namespace
-
-void pi_link_init() {
-    hw_init(PI_LINK_BAUD);
-}
-
-stat_t pi_link_periodic() {
+void rx_poll() {
     if (usart2->US_CSR & (US_CSR_OVRE | US_CSR_FRAME)) {
         usart2->US_CR = US_CR_RSTSTA;  // line errors; the CRC catches any damaged frame
     }
@@ -395,7 +887,7 @@ stat_t pi_link_periodic() {
         } else {
             rx_stall_seen = true;
         }
-        return (STAT_OK);
+        return;
     }
     rx_stall_seen = false;
 
@@ -410,5 +902,103 @@ stat_t pi_link_periodic() {
         w = rx_write_index();
     }
     rx_rearm();
+}
+
+}  // namespace
+
+void pi_link_init() {
+    hw_init(PI_LINK_BAUD);
+}
+
+stat_t pi_link_periodic() {
+    rx_poll();
+    motion_periodic();
+    return (STAT_OK);
+}
+
+bool pi_link_owns_machine() {
+    return (owner != OWNER_USB);
+}
+
+void pi_link_usb_stop() {
+    request_stop(REASON_USB_STOP);
+}
+
+stat_t pi_link_exec_move() {
+    const uint32_t t0 = board_us();
+    last_exec_us      = t0;
+    if (stop_done) {
+        return (STAT_NOOP);     // the final zero segment is queued; the main loop hands back to USB
+    }
+
+    const MotionCommand &c = cmd[cmd_live];
+    if (owner == OWNER_PI) {
+        uint8_t reason = stop_request;
+        if ((reason == REASON_NONE) && ((t0 - c.rx_us) > link_cfg.watchdog_us)) {
+            reason = REASON_WATCHDOG;
+            diag.watchdog_trips++;
+        }
+        if (reason != REASON_NONE) {
+            begin_stop(reason);
+        }
+    }
+
+    float v1[PI_MOTORS];
+    if (owner == OWNER_PI) {
+        for (uint8_t m = 0; m < PI_MOTORS; m++) {
+            v1[m] = c.vel[m];
+        }
+        queued_seq = c.seq;
+        if ((t0 - c.rx_us) > STALE_US) {
+            diag.stale_segments++;
+            fb_stale = true;
+        }
+    } else {
+        stop_t += link_cfg.seg_s;
+        const float frac = (stop_t < stop_len) ? (1.0f - (stop_t / stop_len)) : 0.0f;
+        for (uint8_t m = 0; m < PI_MOTORS; m++) {
+            v1[m] = stop_v0[m] * frac;
+        }
+    }
+
+    float start[MOTORS] = {};
+    float end[MOTORS]   = {};
+    float steps[MOTORS] = {};
+    float ferr[MOTORS]  = {};
+    bool  moving        = false;
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        const float v0 = v_prev[m];
+        const float vv = v1[m];
+        if (((v0 > 0) && (vv < 0)) || ((v0 < 0) && (vv > 0))) {
+            // the DDA can't reverse within a segment: run this one at the average velocity
+            const float avg = 0.5f * (v0 + vv);
+            steps[m] = avg * link_cfg.seg_s;
+            start[m] = fabsf(avg);
+            end[m]   = start[m];
+        } else {
+            steps[m] = 0.5f * (v0 + vv) * link_cfg.seg_s;
+            start[m] = fabsf(v0);
+            end[m]   = fabsf(vv);
+            // a zero starting rate reads as "motor idle" to the loader, which would drop the steps
+            if (start[m] < (end[m] * 1e-6f)) {
+                start[m] = end[m] * 1e-6f;
+            }
+        }
+        if ((fabsf(v0) > 0) || (fabsf(vv) > 0)) {
+            moving = true;
+        }
+        v_prev[m] = vv;
+    }
+    st_prep_line(start, end, steps, ferr, link_cfg.seg_min);
+    diag.segments++;
+    if ((owner == OWNER_STOPPING) && !moving) {
+        stop_done = true;       // this all-zero segment folds the last steps into the step counters
+    }
+
+    const uint32_t dt = board_us() - t0;
+    diag.exec_last_us = (uint16_t)dt;
+    if (dt > diag.exec_max_us) {
+        diag.exec_max_us = (uint16_t)dt;
+    }
     return (STAT_OK);
 }

@@ -108,6 +108,10 @@
 #include "temperature.h"
 #include "hardware.h"
 #include "util.h"
+
+#ifdef PI_LINK
+#include "pi_link.h"
+#endif
 #include "settings.h"
 #include "xio.h"            // for serial queue flush
 #include "kinematics.h"     // for forward kinematics in cm_cycle_start
@@ -376,6 +380,11 @@ cmProbeState    cm_get_probe_state()   { return cm->probe_state[0];}
  */
 cmCombinedState cm_get_combined_state(cmMachine_t *_cm)
 {
+#ifdef PI_LINK
+    if (pi_link_owns_machine()) {
+        return (COMBINED_RUN);      // the Pi is driving the motors: USB sees a busy machine
+    }
+#endif
     switch(_cm->machine_state) {
         case MACHINE_INITIALIZING:
         case MACHINE_READY:

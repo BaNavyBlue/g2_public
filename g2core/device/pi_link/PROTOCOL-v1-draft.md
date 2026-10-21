@@ -1,8 +1,13 @@
-# Pi link protocol, v1 (motion) - DRAFT for review
+# Pi link protocol, v1 (motion) - DRAFT
 
-Status: design only, nothing here is implemented yet. v0 (PROTOCOL.md: framing, PING,
-STATUS) stays as it is; v1 adds frame types for motion. Frame version stays 0 until v1
-ships.
+Status:
+- **Done:** the bench build. It has the control handshake, watchdog, board stop, USB
+  read-only mode and diagnostics. Built without `PI_LINK_MOTION=1`, it holds every motor at
+  zero velocity, so it can't move the machine.
+- **Not done:** motion, and spindle control over the link.
+
+v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
+version stays 0 until v1 ships.
 
 ## Goals
 
@@ -30,32 +35,42 @@ This is how Mesa stepgens and Remora work. Compared with sending target position
             ENABLE accepted
     USB  ------------------->  PI
      ^                          |  DISABLE, watchdog, E-stop, door timeout,
-     |       stop finished      v  g2core alarm/shutdown
+     |       stop finished      v  g2core alarm/shutdown, USB stop, bad frame
      +--------------------- STOPPING
 ```
 
-- **USB** (power-up default): g2core as today. MOTION frames are ignored; the reply says
-  the Pi is not in control.
+- **USB** (power-up default): g2core as today. MOTION and DISABLE get result 5 (not in
+  control).
 - **PI**: the Pi drives the motors.
-  - USB JSON reads and status reports keep working.
-  - USB G-code and JSON writes get error 106 (`STAT_COMMAND_NOT_ACCEPTED`).
-  - All motors stay energized.
+  - USB JSON reads and status reports keep working. Status reports show `stat` 5 (run),
+    with positions following the step counters every 10 ms.
+  - USB G-code, JSON writes and `$` settings get error 106 (`STAT_COMMAND_NOT_ACCEPTED`).
+  - USB `!` (feed hold), `%` (queue flush) and ^D (job kill) start a board stop (reason 7).
+    `~` (cycle start) is ignored. ^X still resets the board.
+  - All motors stay energized at full current, as during a USB job. g2core's idle-current
+    reduction resumes once control is back with USB.
 - **STOPPING**: a board stop is running (see below). It then returns to USB and records
   the reason.
 
 ENABLE is accepted only if all of these hold:
-- g2core is idle: stat 1, 3 or 4, planner and steppers empty, no homing, probe or jog
-  cycle running;
-- the E-stop is clear (`estp` 0);
+- g2core is idle:
+  - stat 1, 3 or 4;
+  - no homing, probe or jog cycle and no feed hold;
+  - planner and steppers empty;
+  - spindle off.
+- The E-stop is clear and acknowledged (`estp` 0).
 - g2core is not in alarm, shutdown or panic.
 
 An open door is allowed: stock firmware lets the machine move with the door open as long
 as the spindle is off.
 
-When control returns to USB, the board resets g2core's position from the step counters
-(`kn_forward_kinematics`, the same path probing uses). Without that, the next USB G-code
-move would start from where g2core last thought the machine was. Homed flags are kept,
-except after an E-stop (g2core clears them itself).
+When control returns to USB, the board does two things:
+- It folds any steps not yet counted into the step counters.
+- It resets g2core's model, planner and runtime positions from the counters (forward
+  kinematics + `cm_set_position_by_axis()`, as homing does). Without that, the next USB
+  G-code move would start from where g2core last thought the machine was.
+
+Homed flags are kept, except after an E-stop (g2core clears them itself).
 
 ## Board stop
 
@@ -66,8 +81,10 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
   its current direction of travel.
 - At the Desktop CNC's top speed (84 mm/s) and 1000 mm/s^2 that takes about 84 ms and
   3.5 mm.
-- Spindle: stopped at the start of every board stop. The one exception is DISABLE, where
-  the spindle is the host's responsibility.
+- The ramp ends with one all-zero segment. Loading that segment folds the last moving
+  segment's steps into the counters.
+- Spindle (once spindle control is in): stopped at the start of every board stop, except
+  DISABLE, where the spindle is the host's responsibility.
 
 | Trigger | Reason code |
 | --- | --- |
@@ -76,9 +93,13 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 | E-stop pressed (g2core also shuts down: spindle off, axes unhomed) | 3 |
 | Door opened with the spindle on, and the host didn't stop in time | 4 |
 | g2core alarm, shutdown or panic | 5 |
-| Bad MOTION frame (NaN, wrong length) | 6 |
+| Bad MOTION frame (wrong length, NaN or infinite velocity, spindle request in a build without spindle control) | 6 |
+| USB `!`, `%` or ^D | 7 |
+| Fault: the segment chain stopped for 20 ms (something reset the steppers) | 8 |
 
 ## Door interlock while the Pi has control
+
+Not in the bench build: it needs spindle control over the link.
 
 - **Spindle off:** reported only (`safe` bit 0), as in stock firmware.
 - **Spindle on:**
@@ -93,22 +114,26 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
     lift off the work.
   - The spindle can't restart until the door is closed and the ESC has rebooted (5 s), as
     in stock firmware.
-- **Lift and resume rules belong to the LinuxCNC config, not the board.**
-  - Lift: after the hold, raise Z by a few mm with an external offset on Z (or QtDragon's
+- **Lift and resume rules belong to the LinuxCNC config, not the board.** The config must
+  include all of these:
+  - **Resume only when all three hold:** door closed, ESC ready, and spindle at speed (from
+    FEEDBACK `safe` and the actual spindle speed). Until then, `motion.feed-inhibit` is held
+    true.
+    - LinuxCNC's own wait for spindle-at-speed only covers the first feed move after a speed
+      change, so it doesn't reliably cover a resume.
+  - **Lift:** after the hold, raise Z by a few mm with an external offset on Z (or QtDragon's
     built-in spindle-lift pause). Returning to the paused point removes the offset.
-  - Resume: wire "door closed AND ESC ready AND spindle at speed" (from FEEDBACK `safe` and
-    actual spindle speed) into `motion.feed-inhibit`.
-  - LinuxCNC's own wait for spindle-at-speed only covers the first feed move after a speed
-    change, so it doesn't reliably cover a resume.
   - Stock g2core can do the same on the USB path: `zl` (lift on feedhold) followed by the
     spindle spin-up delay on resume. The Desktop CNC settings ship `zl` = 0, i.e. no lift;
     the Othermill used -1, i.e. go to Z max.
 
 ## Timing
 
-- The board runs segments of `segment_us` (default 500 µs) on its own clock. With 1 ms
-  frames, each command covers two segments: the first ramps to the new velocity, the
-  second holds it.
+- The board runs segments of `segment_us` (default 500 µs) on its own clock.
+  - Segments are whole DDA ticks: 500 µs becomes 30 ticks at 61 kHz, which is 492 µs.
+    Steps are computed for that real length, so velocities stay exact.
+  - With 1 ms frames, each command covers about two segments: the first ramps to the new
+    velocity, the second holds it.
 - Each segment takes the newest velocity command:
   - start velocity = the end velocity of the previous segment;
   - end velocity = the command, clamped;
@@ -116,14 +141,17 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 - This gives continuous velocity, using `st_prep_line()`'s per-motor ramp form.
   - A motor whose velocity changes sign within a segment runs that segment at constant
     velocity, because the DDA can't reverse mid-segment.
+  - A ramp from exactly zero is started at 1e-6 of the end rate. A zero starting rate makes
+    g2core's loader treat the motor as idle and drop the segment's steps.
 - g2core prepares the next segment while the current one runs, so a command reaches the
   motors 1 to 2 segments (0.5-1 ms) after it arrives. The driver's feedback loop absorbs this.
 - Segment prep runs in g2core's exec interrupt. `st_prep_line()` uses software doubles
   (the Cortex-M3 has no FPU): roughly 20-30 µs per moving motor, so about 100 µs of each
   500 µs segment at worst. Since the velocities already arrive in steps/s, a leaner prep
-  for this path (two multiplies per motor) can replace it if the measurement below says so.
-- If no new command arrived since the last segment, the previous one is reused and
-  `stale_segments` counts it.
+  for this path (two multiplies per motor) can replace it if the measurement says so.
+- A segment counts as stale if the newest command is more than 2 ms old. That means at least
+  one 1 ms frame is missing.
+- Board time comes from SysTick: milliseconds plus the count within the current millisecond.
 - Link budget at 2 Mbaud: MOTION ~34 bytes on the wire, FEEDBACK ~50. That's about 0.4 ms
   of a 1 ms period, and the link is full duplex.
 
@@ -141,14 +169,15 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 | 3 Z | 400 /mm | 33 mm/s | 13.3 k/s |
 | 4 A | 17.78 /deg | 33 deg/s | 0.6 k/s |
 
-The DDA runs at 61 kHz, so no motor can exceed 61 k steps/s. The board also clamps each
-motor to `max_vel` from ENABLE.
+The DDA runs at 61 kHz, so no motor can exceed 61 k steps/s; ENABLE refuses a `max_vel`
+above 95% of that. The board also clamps each motor to `max_vel`.
 
 ## New frame types
 
-Header, COBS and CRC are as in v0. Every request below is answered with FEEDBACK (0x91),
-so the driver handles one reply type. MOTION is sent every servo period without waiting
-for the previous reply; the v0 one-request-in-flight rule still applies to the other types.
+Header, COBS and CRC are as in v0. ENABLE, MOTION, DISABLE and SAFETY are all answered with
+FEEDBACK (0x91), so the driver handles one reply type. MOTION is sent every servo period
+without waiting for the previous reply; the v0 one-request-in-flight rule still applies to
+the other types.
 
 ### 0x10 ENABLE (host -> board), 52 bytes
 
@@ -156,32 +185,50 @@ for the previous reply; the v0 one-request-in-flight rule still applies to the o
 | --- | --- | --- |
 | 0 | u16 | `watchdog_ms`, 2-100 (default 5) |
 | 2 | u16 | `segment_us`, 500-2000 (default 500; 1000 is the fallback, no reflash needed) |
-| 4 | u16 | `hold_timeout_ms`, 50-2000 (suggest 250) |
+| 4 | u16 | `hold_timeout_ms`, 50-2000 (default 250) |
 | 6 | u16 | reserved, 0 |
-| 8 | f32 x4 | `max_vel`, steps/s per motor |
+| 8 | f32 x4 | `max_vel`, steps/s per motor, > 0 and <= 0.95 x 61000 |
 | 24 | f32 x4 | `stop_decel`, steps/s^2 per motor, > 0 |
 | 40 | u8 x12 | reserved, 0 |
+
+The watchdog starts at ENABLE: the first MOTION is due within `watchdog_ms`.
 
 ### 0x11 MOTION (host -> board), 24 bytes
 
 | Offset | Type | Field |
 | --- | --- | --- |
 | 0 | f32 x4 | velocity, steps/s per motor |
-| 16 | u8 | spindle: 0 off, 1 CW (M3), 2 CCW (M4) |
+| 16 | u8 | spindle: 0 off, 1 CW (M3), 2 CCW (M4). Must be 0 until spindle control is in. |
 | 17 | u8 | reserved, 0 |
 | 18 | u16 | reserved for digital outputs, 0 |
 | 20 | f32 | spindle speed, RPM |
 
-Spindle requests go through the same ESC toolhead code and safety checks as M3/M4/M5.
+Spindle requests will go through the same ESC toolhead code and safety checks as M3/M4/M5.
 
 ### 0x12 DISABLE (host -> board), no payload
 
-The board starts a board stop (reason 1) and replies.
+The board starts a board stop (reason 1) and replies. While a stop is already running the
+reply is result 0.
 
 ### 0x13 SAFETY (host -> board), 1 byte
 
 1 = acknowledge E-stop (as `{"estpc":n}`), 2 = clear alarm or shutdown (as `{"clear":n}`).
-Only accepted while USB has control.
+Only accepted while USB has control (result 6 otherwise).
+
+### 0x03 DIAG_REQ (host -> board), no payload; reply 0x83 DIAG, 20 bytes
+
+Counters reset at each ENABLE.
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | u16 | exec interrupt time, max, µs |
+| 2 | u16 | exec interrupt time, last, µs |
+| 4 | u32 | longest gap between main-loop passes while the Pi had control, µs |
+| 8 | u32 | segments prepared |
+| 12 | u16 | stale segments |
+| 14 | u16 | watchdog trips (since power-up) |
+| 16 | u16 | segment length, DDA ticks |
+| 18 | u16 | reserved, 0 |
 
 ### 0x91 FEEDBACK (board -> host), 40 bytes
 
@@ -190,16 +237,16 @@ Only accepted while USB has control.
 | 0 | u8 | `result` for the request answered: 0 ok, else a reason (table below) |
 | 1 | u8 | owner: 0 USB, 1 PI, 2 STOPPING |
 | 2 | u8 | last release reason (board stop table), 0 = none since the last ENABLE |
-| 3 | u8 | flags: bit0 `hold_request`, bit1 velocity clamped this period, bit2 stale segment since last FEEDBACK |
+| 3 | u8 | flags: bit0 `hold_request`, bit1 velocity clamped, bit2 stale segment (both since the last FEEDBACK), bit3 motion locked (bench build) |
 | 4 | u32 | board time, µs (wraps after about 71 minutes) |
 | 8 | i32 x4 | position: steps emitted per motor at that time (wraps; the driver unwraps) |
-| 24 | u16 | seq of the MOTION now playing in the running segment |
+| 24 | u16 | seq of the newest MOTION taken into a segment |
 | 26 | u16 | `stale_segments` counter |
 | 28 | u8 | `safe` (as STATUS) |
 | 29 | u8 | `estp` (as STATUS) |
 | 30 | u16 | inputs, bit (N-1) = `inN` |
 | 32 | u8 | spindle direction, actual |
-| 33 | u8 | g2core combined state (`stat`) |
+| 33 | u8 | g2core combined state (`stat`; 5 while the Pi has control) |
 | 34 | u16 | reserved, 0 |
 | 36 | f32 | spindle speed, actual |
 
@@ -207,53 +254,52 @@ Only accepted while USB has control.
 
 | Code | Meaning |
 | --- | --- |
-| 1 | not idle |
+| 1 | not idle (includes spindle on at ENABLE) |
 | 2 | E-stop active or not acknowledged |
 | 3 | alarm, shutdown or panic |
-| 4 | bad parameter |
+| 4 | bad parameter or bad frame |
 | 5 | not in control (MOTION or DISABLE while USB has control) |
-| 6 | already in control (ENABLE twice) |
+| 6 | the Pi has control (ENABLE twice, SAFETY while in control) |
 
-## Firmware changes this needs
+## Firmware hooks (all under `#ifdef PI_LINK`)
 
-1. `stepper.cpp` exec interrupt: while the Pi has control, call `pi_link_exec_move()`
-   instead of `mp_exec_move()`.
-2. `pi_link.cpp`:
-   - the ownership state machine;
-   - a double-buffered latest command (the main loop writes it, the exec interrupt reads it);
-   - the board-stop ramp generator;
-   - FEEDBACK built from the step counters (`encoder_steps` + `steps_run`, read with
-     interrupts briefly off);
-   - a µs clock from the Cortex-M3 cycle counter.
-3. Reject USB writes while the Pi has control, at the command dispatcher.
-4. Keep the motors energized while the Pi has control. Normal power timeouts resume
-   afterwards.
-5. Re-sync g2core's position on release.
+| File | Change |
+| --- | --- |
+| `stepper.cpp` | Exec interrupt: `pi_link_exec_move()` instead of `mp_exec_move()` while the Pi has control. Motor power callback: skipped while the Pi has control. |
+| `alarm.cpp` | `cm_is_alarmed()` returns 106 while the Pi has control. It gates every USB setting, JSON write and G-code block. |
+| `controller.cpp` | `!`, `%`, ^D and `~` handling while the Pi has control. |
+| `canonical_machine.cpp` | `cm_get_combined_state()` reports RUN while the Pi has control. |
+| `device/pi_link/pi_link.cpp` | Everything else. |
+
+A build without `PI_LINK` is unchanged: same size, same behaviour.
 
 ## Test plan
 
-1. **No motion:** the ENABLE and DISABLE handshake, every rejection reason, USB writes
-   refused while the Pi has control, and a watchdog trip at zero velocity.
-2. **Host simulation:** the command buffer and board-stop ramp, as with the v0 receive ring.
+1. **Bench build, no motion possible:**
+   - the ENABLE and DISABLE handshake, and each rejection reason;
+   - USB writes refused while the Pi has control, and `stat` 5;
+   - USB `!` handing control back;
+   - a watchdog trip (the host stops sending);
+   - E-stop while the Pi has control, then SAFETY ack and clear over the link;
+   - DIAG timing under a 10-minute 1 kHz stream.
+2. **Host simulation** of the exec path (fake `st_prep_line()`): ramps, sign changes, the
+   board stop and step accounting, before the motion build.
 3. **Slow motion, one motor** (you present, door closed): feedback steps against commanded
-   velocity x time.
-4. **Board stops during slow motion:** watchdog (the host stops sending), DISABLE, E-stop,
-   and the door with the spindle on.
+   velocity x time. All four motors at a slow speed give the worst-case exec time.
+4. **Board stops during slow motion:** watchdog, DISABLE, E-stop, USB `!`, and the door with
+   the spindle on.
 5. **After a Pi session:** USB G-code moves start from the right place.
 6. **LinuxCNC HAL driver:** its own spec. It reads the previous FEEDBACK without blocking,
    updates `pos-fb`, computes velocities and sends MOTION, all in the servo thread.
 
-## Checks before any motion test
+## Checks before fast motion
 
-The no-motion firmware reports these in STATUS. Motion tests start only if they pass:
-
-- Worst-case exec interrupt time below 25% of `segment_us` (125 µs at 500 µs), with all
-  four motors commanded. Otherwise use the leaner prep, or 1000 µs segments.
-- Worst-case gap between main-loop passes while the Pi has control below 2 ms. Frames are
-  handled in the main loop, so a longer stall could trip the watchdog. Otherwise move MOTION
-  handling into the exec interrupt.
-- Zero `stale_segments` and zero receive errors over 10 minutes of 1 kHz MOTION frames at
-  zero velocity.
+- Worst-case exec interrupt time below 25% of the segment (about 123 µs), with all four
+  motors moving. Otherwise use the leaner prep, or 1000 µs segments.
+- Longest main-loop gap while the Pi has control below 2 ms. Frames are handled in the main
+  loop, so a longer stall could trip the watchdog. Otherwise move MOTION handling into the
+  exec interrupt.
+- Zero stale segments and zero receive errors over 10 minutes of 1 kHz MOTION frames.
 
 ## Decisions (2026-10-20)
 
@@ -263,15 +309,13 @@ The no-motion firmware reports these in STATUS. Motion tests start only if they 
      watchdog doesn't trip on normal jitter.
    - At top speed the machine travels about 0.4 mm before the stop begins.
    - LinuxCNC itself reports a realtime fault at stalls of that size.
-3. **USB while the Pi has control (proposed):**
-   - Status reports show `stat` 5 (run), with positions updated live from the step
-     counters. A USB app sees what it would during a job.
-   - Writes are refused with error 106 rather than queued as during a normal job. A move
-     queued now would otherwise run, unexpectedly, after the Pi hands control back.
+3. **USB while the Pi has control:** `stat` 5 with live positions, and writes refused with
+   error 106 rather than queued. A queued move would otherwise run, unexpectedly, after the
+   Pi hands control back. (Confirmed.)
 4. **Door with the spindle on: cooperative pause, resumable.**
-   - LinuxCNC feed-holds, and the board stops the spindle.
-   - When the door reads closed and the ESC is back (about 5 s if it lost power), LinuxCNC
-     restarts the spindle, waits for it to reach speed, and resumes the program.
+   - LinuxCNC feed-holds, the board stops the spindle, and Z lifts.
+   - The resume waits for door closed, ESC ready and spindle at speed (all three are
+     required).
    - A false door signal therefore costs a pause, not the job. Only the board's 250 ms
      backstop (LinuxCNC failed to pause) ends the program.
 5. **Probe: no latch in v1.**

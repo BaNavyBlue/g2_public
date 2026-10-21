@@ -44,6 +44,10 @@
 
 #include "spindle.h"
 
+#ifdef PI_LINK
+#include "pi_link.h"
+#endif
+
 /**** Debugging output with semihosting ****/
 
 #include "MotateDebug.h"
@@ -244,6 +248,11 @@ stat_t st_clc(nvObj_t *nv)    // clear diagnostic counters, reset stepper prep
 
 stat_t st_motor_power_callback()     // called by controller
 {
+#ifdef PI_LINK
+    if (pi_link_owns_machine()) {    // motors stay energized while the Pi has control
+        return (STAT_NOOP);
+    }
+#endif
     if (!mp_is_phat_city_time()) {   // don't process this if you are time constrained in the planner
         return (STAT_NOOP);
     }
@@ -398,7 +407,13 @@ namespace Motate {    // Define timer inside Motate namespace
     {
         exec_timer.getInterruptCause();                    // clears the interrupt condition
         if (st_pre.buffer_state == PREP_BUFFER_OWNED_BY_EXEC) {
+#ifdef PI_LINK
+            // while the Pi has control its velocity commands feed the segments, not the planner
+            const stat_t status = pi_link_owns_machine() ? pi_link_exec_move() : mp_exec_move();
+            if (status != STAT_NOOP) {
+#else
             if (mp_exec_move() != STAT_NOOP) {
+#endif
                 st_pre.buffer_state = PREP_BUFFER_OWNED_BY_LOADER; // flip it back
                 st_request_load_move();
                 return;

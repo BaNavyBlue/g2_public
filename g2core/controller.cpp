@@ -42,6 +42,10 @@
 #include "gpio.h"
 #include "report.h"
 #include "help.h"
+
+#ifdef PI_LINK
+#include "pi_link.h"
+#endif
 #include "util.h"
 #include "xio.h"
 #include "settings.h"
@@ -274,6 +278,21 @@ static void _dispatch_kernel(const devflags_t flags)
             return;
         }
     }
+
+#ifdef PI_LINK
+    // While the Pi has control: feedhold, queue flush and job kill stop the machine and hand
+    // control back; cycle start is ignored
+    if (pi_link_owns_machine() &&
+        ((*cs.bufp == '!') || (*cs.bufp == '~') || (*cs.bufp == '%') || (*cs.bufp == EOT))) {
+        if (*cs.bufp != '~') {
+            pi_link_usb_stop();
+        }
+        if ((*cs.bufp == '%') || (*cs.bufp == EOT)) {
+            xio_flush_to_command();
+        }
+        return;
+    }
+#endif
 
     // trap single character commands
     if      (*cs.bufp == '!') { cm_request_feedhold(FEEDHOLD_TYPE_ACTIONS, FEEDHOLD_EXIT_CYCLE); }

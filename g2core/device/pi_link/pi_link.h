@@ -15,8 +15,10 @@
  * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 /*
- * Protocol: see PROTOCOL.md in this directory. v0 is echo and status only.
+ * Protocol: see PROTOCOL.md (v0: echo and status) and PROTOCOL-v1-draft.md (motion).
  * Built only with `make ... PI_LINK=1`; without it this code is not compiled at all.
+ * Motion over the link also needs PI_LINK_MOTION=1; without it the board takes control
+ * when asked but holds every motor at zero velocity (bench builds).
  */
 
 #ifndef PI_LINK_H_ONCE
@@ -28,7 +30,15 @@
 #define PI_LINK_BAUD 115200
 #endif
 
+#ifndef PI_LINK_MOTION
+#define PI_LINK_MOTION 0
+#endif
+
 void pi_link_init();        // call once from hardware_init()
 stat_t pi_link_periodic();  // call from hardware_periodic(); never blocks
+
+bool pi_link_owns_machine();    // the Pi has control (or is handing it back): USB is read-only
+stat_t pi_link_exec_move();     // stepper exec interrupt: next segment while the Pi has control
+void pi_link_usb_stop();        // USB '!', '%' or ^D while the Pi has control: stop and hand back
 
 #endif  // End of include guard: PI_LINK_H_ONCE

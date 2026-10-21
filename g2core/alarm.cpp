@@ -38,6 +38,10 @@
 #include "temperature.h"
 #include "util.h"
 
+#ifdef PI_LINK
+#include "pi_link.h"
+#endif
+
 /****************************************************************************************
  * ALARM, SHUTDOWN, and PANIC are nested dolls.
  *
@@ -111,6 +115,12 @@ void cm_parse_clear(const char *s)
 
 stat_t cm_is_alarmed()
 {
+#ifdef PI_LINK
+    // This gates every USB setting, JSON write and G-code block: read-only while the Pi has control
+    if (pi_link_owns_machine()) {
+        return (STAT_COMMAND_NOT_ACCEPTED);
+    }
+#endif
     return safety_manager->is_system_alarmed();
 }
 

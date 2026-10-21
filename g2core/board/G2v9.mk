@@ -47,11 +47,15 @@ ifeq ("$(BASE_BOARD)","g2v9")
 	include $(PLATFORM_BASE).mk
 
 	# Binary link to a LinuxCNC host on J17 (USART2): make ... PI_LINK=1 [PI_LINK_BAUD=2000000]
+	# Motion over the link needs PI_LINK_MOTION=1 too; without it every velocity is held at zero.
 	ifeq ("$(PI_LINK)", "1")
 		DEVICE_DEFINES += PI_LINK=1
 		SOURCE_DIRS += device/pi_link
 		ifneq ("$(PI_LINK_BAUD)", "")
 			DEVICE_DEFINES += PI_LINK_BAUD=$(PI_LINK_BAUD)
+		endif
+		ifeq ("$(PI_LINK_MOTION)", "1")
+			DEVICE_DEFINES += PI_LINK_MOTION=1
 		endif
 	endif
 
