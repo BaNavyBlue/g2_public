@@ -46,6 +46,15 @@ ifeq ("$(BASE_BOARD)","g2v9")
 
 	include $(PLATFORM_BASE).mk
 
+	# Binary link to a LinuxCNC host on J17 (USART2): make ... PI_LINK=1 [PI_LINK_BAUD=2000000]
+	ifeq ("$(PI_LINK)", "1")
+		DEVICE_DEFINES += PI_LINK=1
+		SOURCE_DIRS += device/pi_link
+		ifneq ("$(PI_LINK_BAUD)", "")
+			DEVICE_DEFINES += PI_LINK_BAUD=$(PI_LINK_BAUD)
+		endif
+	endif
+
 	ifeq ("$(BANTAM)", "1")
 		DEVICE_DEFINES += BANTAM=1
 		SOURCE_DIRS += device/bantam_safety_manager

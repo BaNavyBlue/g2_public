@@ -42,6 +42,10 @@
 
 #include "board_gpio.h"
 
+#ifdef PI_LINK
+#include "pi_link.h"
+#endif
+
 #ifndef SPINDLE_ENABLE_OUTPUT_NUMBER
 #warning SPINDLE_ENABLE_OUTPUT_NUMBER is defaulted to 4!
 #warning SPINDLE_ENABLE_OUTPUT_NUMBER should be defined in settings or a board file!
@@ -105,6 +109,9 @@ void hardware_init()
     board_hardware_init();
     toolhead_for_tool(0)->init();
     spindle_set_toolhead(toolhead_for_tool(0));
+#ifdef PI_LINK
+    pi_link_init();
+#endif
 	return;
 }
 
@@ -115,6 +122,9 @@ void hardware_init()
 stat_t hardware_periodic()
 {
     sd_card.periodicCheck();
+#ifdef PI_LINK
+    pi_link_periodic();
+#endif
     return STAT_OK;
 }
 

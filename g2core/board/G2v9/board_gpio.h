@@ -78,7 +78,62 @@ extern gpioDigitalInputPin<IRQPin<Motate::kInput6_PinNumber>>  din6;
 extern gpioDigitalInputPin<IRQPin<Motate::kInput7_PinNumber>>  din7;
 extern gpioDigitalInputPin<IRQPin<Motate::kInput8_PinNumber>>  din8;
 extern gpioDigitalInputPin<IRQPin<Motate::kInput9_PinNumber>>  din9;
+#ifdef PI_LINK
+/*
+ * With PI_LINK, J17 "CS2" (PB21) is the Pi link's UART RX and its factory jumper is
+ * removed, so the machine-type strap that used to be read there is reported as a fixed
+ * state instead (active = jumper fitted), keeping what the host software sees unchanged.
+ */
+struct gpioDigitalInputFixed final : gpioDigitalInput {
+    ioEnabled enabled;
+    ioPolarity polarity;
+    inputAction action = INPUT_ACTION_NONE;
+    uint8_t proxy_pin_number = 0;
+    const bool fixed_state;
+
+    gpioDigitalInputFixed(const ioEnabled _enabled, const ioPolarity _polarity, const uint8_t _proxy_pin_number, const bool _state) :
+        gpioDigitalInput{},
+        enabled{_enabled},
+        polarity{_polarity},
+        fixed_state{_state}
+    {
+        setExternalNumber(_proxy_pin_number);
+    };
+
+    bool getState() override
+    {
+        if (enabled <= IO_DISABLED) {
+            return false;
+        }
+        return fixed_state;
+    };
+    inputAction getAction() override { return action; };
+    bool setAction(const inputAction a) override { action = a; return true; };
+    ioEnabled getEnabled() override { return enabled; };
+    bool setEnabled(const ioEnabled m) override { enabled = m; return true; };
+    ioPolarity getPolarity() override { return polarity; };
+    bool setPolarity(const ioPolarity p) override { polarity = p; return true; };
+    bool setExternalNumber(const uint8_t e) override
+    {
+        if (e == proxy_pin_number) {
+            return true;
+        }
+        if (proxy_pin_number > 0) {
+            in_r[proxy_pin_number-1]->setPin(nullptr);
+        }
+        proxy_pin_number = e;
+        if (proxy_pin_number > 0) {
+            in_r[proxy_pin_number-1]->setPin(this);
+        }
+        return true;
+    };
+    const uint8_t getExternalNumber() override { return proxy_pin_number; };
+    void setLockout(const uint16_t) override {};
+};
+extern gpioDigitalInputFixed din10;
+#else
 extern gpioDigitalInputPin<IRQPin<Motate::kSocket2_SPISlaveSelectPinNumber>> din10;
+#endif
 // extern gpioDigitalInputPin<IRQPin<Motate::kInput11_PinNumber>> din11;
 // extern gpioDigitalInputPin<IRQPin<Motate::kInput12_PinNumber>> din12;
 
