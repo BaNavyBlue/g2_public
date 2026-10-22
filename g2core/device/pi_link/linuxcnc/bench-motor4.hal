@@ -1,0 +1,54 @@
+# Bench test: the driver's position loop on motor 4 only (on board 2 nothing is attached to it).
+# X/Y/Z stay disabled and are clamped to 2 steps/s by the driver and by the board.
+#   halrun -U; halrun -f bench-motor4.hal; halrun -U
+# ENABLE energizes every motor: afterwards send {"md":0} over USB.
+# Uninstalled module: replace "loadrt pilink" with
+#   loadrt ../../../../home/srjc/p/pilink hal_name=../../../../home/srjc/p/pilink
+
+loadrt threads name1=servo-thread period1=1000000
+loadrt pilink
+loadrt siggen
+loadrt sum2
+loadrt limit3
+loadrt sampler depth=16384 cfg=ffffbs
+addf pilink.read    servo-thread
+addf siggen.0.update servo-thread
+addf sum2.0         servo-thread
+addf limit3.0       servo-thread
+addf pilink.write   servo-thread
+addf sampler.0      servo-thread
+
+setp pilink.0.maxvel 0.01
+setp pilink.0.board-maxvel 0.01
+setp pilink.1.maxvel 0.01
+setp pilink.1.board-maxvel 0.01
+setp pilink.2.maxvel 0.005
+setp pilink.2.board-maxvel 0.005
+
+# motor 4 in raw steps: square wave +-4000 steps, smoothed by limit3 into trapezoids
+setp pilink.3.scale 1
+setp pilink.3.maxvel 20000
+setp pilink.3.maxaccel 200000
+setp pilink.3.board-maxvel 30000
+setp pilink.3.stop-decel 50000
+setp pilink.3.enable 1
+setp siggen.0.frequency 0.25
+setp siggen.0.amplitude 0
+setp limit3.0.maxv 15000
+setp limit3.0.maxa 100000
+net sq    siggen.0.square      => sum2.0.in0
+net tgt   sum2.0.out           => limit3.0.in
+net cmd3  limit3.0.out         => pilink.3.position-cmd sampler.0.pin.0
+net fb3   pilink.3.position-fb => sampler.0.pin.1
+net err3  pilink.3.error       => sampler.0.pin.2
+net vel3  pilink.3.velocity-cmd => sampler.0.pin.3
+net ctl   pilink.in-control    => sampler.0.pin.4
+net st    pilink.state         => sampler.0.pin.5
+
+start
+loadusr -w bash bench-motor4.sh
+stop
+show pin pilink
+show param pilink.read.tmax
+show param pilink.write.tmax
+show thread

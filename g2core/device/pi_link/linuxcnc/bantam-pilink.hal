@@ -1,0 +1,69 @@
+# Bantam Tools Desktop CNC over the g2core Pi link (see HAL-DRIVER.md).
+# Needs pilink installed once:  sudo halcompile --install pilink.c
+
+loadrt [KINS]KINEMATICS
+loadrt [EMCMOT]EMCMOT servo_period_nsec=[EMCMOT]SERVO_PERIOD num_joints=[KINS]JOINTS
+loadrt pilink port=[PILINK]PORT baud=[PILINK]BAUD
+loadrt and2 names=estop-and
+
+# pilink.read first (feedback in), pilink.write last (MOTION out)
+addf pilink.read             servo-thread
+addf motion-command-handler  servo-thread
+addf motion-controller       servo-thread
+addf pilink.write            servo-thread
+addf estop-and               servo-thread
+
+setp pilink.segment-us  [PILINK]SEGMENT_US
+setp pilink.watchdog-ms [PILINK]WATCHDOG_MS
+setp pilink.p-gain      [PILINK]P_GAIN
+setp pilink.latency     [PILINK]LATENCY
+
+# Machine on <-> the Pi has control. A refused ENABLE or a board stop shows up as an amp fault.
+net machine-on   motion.motion-enabled => pilink.enable
+net link-fault   pilink.fault => joint.0.amp-fault-in joint.1.amp-fault-in joint.2.amp-fault-in
+
+# X = motor 1 (pilink.0), home switch in1
+setp pilink.0.scale      [JOINT_0]SCALE
+setp pilink.0.maxvel     [JOINT_0]STEPGEN_MAXVEL
+setp pilink.0.maxaccel   [JOINT_0]STEPGEN_MAXACCEL
+setp pilink.0.stop-decel [JOINT_0]STOP_DECEL
+net x-pos-cmd  joint.0.motor-pos-cmd  => pilink.0.position-cmd
+net x-pos-fb   pilink.0.position-fb   => joint.0.motor-pos-fb
+net x-enable   joint.0.amp-enable-out => pilink.0.enable
+net x-home-sw  pilink.input-01        => joint.0.home-sw-in
+
+# Y = motor 2 (pilink.1), home switch in3
+setp pilink.1.scale      [JOINT_1]SCALE
+setp pilink.1.maxvel     [JOINT_1]STEPGEN_MAXVEL
+setp pilink.1.maxaccel   [JOINT_1]STEPGEN_MAXACCEL
+setp pilink.1.stop-decel [JOINT_1]STOP_DECEL
+net y-pos-cmd  joint.1.motor-pos-cmd  => pilink.1.position-cmd
+net y-pos-fb   pilink.1.position-fb   => joint.1.motor-pos-fb
+net y-enable   joint.1.amp-enable-out => pilink.1.enable
+net y-home-sw  pilink.input-03        => joint.1.home-sw-in
+
+# Z = motor 3 (pilink.2), home switch in6 at the top
+setp pilink.2.scale      [JOINT_2]SCALE
+setp pilink.2.maxvel     [JOINT_2]STEPGEN_MAXVEL
+setp pilink.2.maxaccel   [JOINT_2]STEPGEN_MAXACCEL
+setp pilink.2.stop-decel [JOINT_2]STOP_DECEL
+net z-pos-cmd  joint.2.motor-pos-cmd  => pilink.2.position-cmd
+net z-pos-fb   pilink.2.position-fb   => joint.2.motor-pos-fb
+net z-enable   joint.2.amp-enable-out => pilink.2.enable
+net z-home-sw  pilink.input-06        => joint.2.home-sw-in
+
+# Motor 4 (A, not fitted): pilink.3.enable stays unconnected, so it always gets 0 velocity.
+
+# Probe: in5 closes when the tool touches the bed
+net probe      pilink.input-05 => motion.probe-input
+
+# E-stop: LinuxCNC's chain AND the board (link up, E-stop clear and acknowledged, no alarm).
+# An E-stop reset (F1) also acknowledges and clears the board's E-stop over the link.
+net estop-user   iocontrol.0.user-enable-out    => estop-and.in0
+net estop-board  pilink.estop-ok                => estop-and.in1
+net estop-ok     estop-and.out                  => iocontrol.0.emc-enable-in
+net estop-reset  iocontrol.0.user-request-enable => pilink.estop-reset
+
+# No tool changer
+net tool-prep-loop   iocontrol.0.tool-prepare iocontrol.0.tool-prepared
+net tool-change-loop iocontrol.0.tool-change  iocontrol.0.tool-changed
