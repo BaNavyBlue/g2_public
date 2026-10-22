@@ -15,6 +15,7 @@ Examples (on the Pi, J17 wired to GPIO14/15; add -b 2000000 for a 2 Mbaud board)
     pi_link_test.py safety ack|clear         # E-stop acknowledge / clear alarm, while USB has control
     pi_link_test.py move -m 1 -d 1000 -v 400 # motion builds only: motor 1 +1000 steps at 400 steps/s
     pi_link_test.py move -m 1 -d 4000 -v 2000 --stop watchdog   # ...go silent mid-move
+    pi_link_test.py move -m 1 2 -d 1000 -500 # motors 1 and 2 on one straight line, motor 1 leading
 """
 
 import argparse
@@ -367,22 +368,32 @@ def cmd_stream(link, args):
 
 
 def cmd_move(link, args):
-    """Motion builds only. One motor: trapezoid (ramp, cruise, ramp) of `dist` steps at up to
-    `vel` steps/s, sent open-loop as 1 kHz velocity commands under a low max_vel set at ENABLE.
-    Compares the board's step count with the commanded integral. --stop ends it mid-cruise."""
-    m = args.motor - 1
+    """Motion builds only. One or more motors on a straight line: the motor with the longest move
+    runs a trapezoid (ramp, cruise, ramp) at up to `vel` steps/s and `accel` steps/s^2, and the
+    others are scaled to start and finish with it. Sent open-loop as 1 kHz velocity commands
+    under a low max_vel set at ENABLE. Compares the board's step counts with the commanded
+    integrals. --stop ends it mid-cruise."""
+    motors = [m - 1 for m in args.motor]
+    if len(set(motors)) != len(motors) or len(args.dist) not in (1, len(motors)):
+        print("give each motor once, and one distance for all of them or one per motor")
+        return 1
+    dists = args.dist * len(motors) if len(args.dist) == 1 else args.dist
+    d = max(abs(x) for x in dists)
+    if d == 0:
+        print("nothing to move")
+        return 1
+    scale = [x / d for x in dists]                 # signed share of the lead motor's profile
     max_vel = list(args.max_vel)
     decel = [args.decel] * 4
-    fb = request_feedback(link, ENABLE, enable_payload(5, 500, 250, max_vel, decel))
+    fb = request_feedback(link, ENABLE, enable_payload(5, args.segment_us, 250, max_vel, decel))
     print("ENABLE: " + format_feedback(fb))
     if fb["result"] != 0:
         return 1
     if fb["flags"] & 8:
         print("this board's firmware is motion-locked (bench build): nothing will move")
-    start = fb["pos"][m]
+    start = list(fb["pos"])
 
-    v, a, d = abs(args.vel), args.accel, abs(args.dist)
-    sign = 1 if args.dist >= 0 else -1
+    v, a = abs(args.vel), args.accel
     t_ramp = v / a
     if a * t_ramp * t_ramp > d:                  # never reaches cruise: triangle profile
         t_ramp = (d / a) ** 0.5
@@ -402,7 +413,7 @@ def cmd_move(link, args):
     ser.timeout = 0
     period = 0.001
     t0 = next_t = time.perf_counter()
-    commanded, buf, last_print, silent, last = 0.0, bytearray(), -1.0, False, None
+    commanded, buf, last_print, silent, last = [0.0] * len(motors), bytearray(), -1.0, False, None
     while True:
         t = time.perf_counter() - t0
         if t > total + 0.05:
@@ -413,11 +424,12 @@ def cmd_move(link, args):
             if args.stop == "disable":
                 ser.write(build_frame(DISABLE, link.next_seq()))
         if not silent:
-            vv = sign * vel_at(t)
+            vv = vel_at(t)
             vel = [0.0, 0.0, 0.0, 0.0]
-            vel[m] = vv
+            for i, m in enumerate(motors):
+                vel[m] = scale[i] * vv
+                commanded[i] += vel[m] * period
             ser.write(build_frame(MOTION, link.next_seq(), motion_payload(vel)))
-            commanded += vv * period
         buf += ser.read(4096)
         while b"\x00" in buf:
             raw, _, rest = bytes(buf).partition(b"\x00")
@@ -431,8 +443,10 @@ def cmd_move(link, args):
             last = decode_feedback(frame[4:-4])
             if t - last_print >= 0.25:
                 last_print = t
-                print("%7.3f s  owner %-8s pos %+7d  (commanded so far %+8.1f)"
-                      % (t, name(OWNERS, last["owner"]), last["pos"][m] - start, commanded))
+                print("%7.3f s  owner %-8s pos %s  (commanded so far %s)"
+                      % (t, name(OWNERS, last["owner"]),
+                         " ".join("%+7d" % (last["pos"][m] - start[m]) for m in motors),
+                         " ".join("%+8.1f" % c for c in commanded)))
         if silent and args.stop == "watchdog" and t > stop_at + 0.5:
             break
         next_t += period
@@ -443,10 +457,11 @@ def cmd_move(link, args):
         fb = request_feedback(link, DISABLE)
     time.sleep(0.2)
     fb = request_feedback(link, MOTION, motion_payload())     # just to read owner, reason and position
-    moved = fb["pos"][m] - start
     print("end: " + format_feedback(fb))
-    print("motor %d moved %+d steps; commanded %+.1f; difference %+.1f"
-          % (args.motor, moved, commanded, moved - commanded))
+    for i, m in enumerate(motors):
+        moved = fb["pos"][m] - start[m]
+        print("motor %d moved %+d steps; commanded %+.1f; difference %+.1f"
+              % (m + 1, moved, commanded[i], moved - commanded[i]))
     print_diag(link)
     return 0
 
@@ -469,14 +484,16 @@ def main():
     p = sub.add_parser("safety")
     p.add_argument("action", choices=["ack", "clear"])
     p = sub.add_parser("move")
-    p.add_argument("-m", "--motor", type=int, choices=[1, 2, 3, 4], required=True)
-    p.add_argument("-d", "--dist", type=float, required=True, help="steps, signed")
-    p.add_argument("-v", "--vel", type=float, default=400, help="cruise, steps/s")
-    p.add_argument("-a", "--accel", type=float, default=2000, help="steps/s^2")
+    p.add_argument("-m", "--motor", type=int, nargs="+", choices=[1, 2, 3, 4], required=True)
+    p.add_argument("-d", "--dist", type=float, nargs="+", required=True,
+                   help="steps, signed: one for all motors, or one per motor")
+    p.add_argument("-v", "--vel", type=float, default=400, help="cruise of the longest move, steps/s")
+    p.add_argument("-a", "--accel", type=float, default=2000, help="of the longest move, steps/s^2")
     p.add_argument("--decel", type=float, default=20000, help="board stop decel, steps/s^2")
     p.add_argument("--max-vel", type=float, nargs=4, default=[2000, 2000, 2000, 200],
                    help="board clamp per motor, steps/s (default ~10, 10, 5 mm/s, 11 deg/s)")
     p.add_argument("--stop", choices=["watchdog", "disable"])
+    p.add_argument("--segment-us", type=int, default=500, help="board segment length, 500-2000 us")
     p = sub.add_parser("stream")
     p.add_argument("-s", "--seconds", type=float, default=10)
     p.add_argument("--period-ms", type=float, default=1.0)

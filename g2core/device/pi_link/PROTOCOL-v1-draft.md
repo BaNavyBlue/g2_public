@@ -9,7 +9,20 @@ Status:
   - USB flood, watchdog, USB stop, E-stop and recovery over the link.
   - USB golden transcript and fuzz tests.
 - **Simulation:** `sim/run.sh` passes for the motion path.
-- **Motion build** (`PI_LINK_MOTION=1`): built, not yet run on the machine.
+- **Motion results (board 2, 2026-10-21, 101.17-13-g3a4d):** slow motion and board stops pass.
+  - X, Y and Z out and back at 2 mm/s: within 1 step; every handback lands USB's position on
+    the step counts and keeps the homed flags. USB G-code moves afterwards start correctly.
+  - Board stops mid-move: watchdog +109 steps past the last command (110 predicted), DISABLE
+    +101 (100), USB `!` back to USB in under 250 ms, E-stop stopped within about 18 steps.
+  - All four motors (motor 4 has no motor attached, so it ran at 17,000 steps/s) under a `$$`
+    flood: 0 underruns, 0 stale, X/Y/Z exact. Exec max 182 µs moving, 213 µs in a board stop.
+    The exec time doesn't depend on step rate (92 µs from 2,000 to 40,000 steps/s on one
+    motor) but grows about 30 µs per moving motor.
+  - **500 µs segments fail the 25% budget** (36-42%); 1000 µs segments pass (18-21%).
+  - Open: the E-stop is only checked from the main loop, which stalled for up to 440 ms
+    while printing `$$` dumps; the DDA timer runs at 61,046.5 Hz (84 MHz / 2 / 688), not
+    61,000, so velocities come out 762 ppm fast; after an E-stop USB's position was 3 steps
+    off the counts.
 - **Not done:** spindle control over the link, and the door hold.
 
 v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
