@@ -52,10 +52,13 @@ void cm_set_position_by_axis(const uint8_t axis, const float position) { synced_
 void mp_set_runtime_position(uint8_t, const float) {}
 static const float steps_per_unit[4] = {200.0f, 200.0f, 400.0f, 1600.0f / 90.0f};
 static const uint8_t axis_of[4]      = {AXIS_X, AXIS_Y, AXIS_Z, AXIS_A};
+static float kn_offset[4] = {};             // the kinematics' step offset, which g2core re-bases on position resets
 void kn_forward_kinematics(const float steps[], float travel[]) {
     for (int a = 0; a < AXES; a++) travel[a] = 0;
-    for (int m = 0; m < 4; m++) travel[axis_of[m]] = steps[m] / steps_per_unit[m];
+    for (int m = 0; m < 4; m++) travel[axis_of[m]] = (steps[m] - kn_offset[m]) / steps_per_unit[m];
 }
+static bool sim_estop = false;
+bool gpio_read_input(const uint8_t input_num) { return (input_num == ESTOP_SWITCH_INPUT) && sim_estop; }
 
 // ---- the real lean prep, wrapped to record what each segment intends ----
 #define st_prep_velocity_segment st_prep_velocity_segment_real
@@ -223,6 +226,7 @@ static void host_drain_tx() {
 }
 
 // ---- run the machine for a while; profile(t_s, v) fills velocities or returns false to stay silent ----
+static bool main_stalled = false;           // the main loop is busy elsewhere (a long USB reply)
 static void run_for(double seconds, std::function<bool(double, float *)> profile) {
     const uint64_t end = sim_tick + (uint64_t)(seconds * 61000.0);
     double next_frame_us = now_us();
@@ -238,7 +242,7 @@ static void run_for(double seconds, std::function<bool(double, float *)> profile
             if (profile(now_us() / 1e6, v)) host_motion(v);
         }
         if (usart_pending && usart_enabled) { usart_pending = false; USART2_Handler(); }
-        if (sim_tick >= next_main) { next_main = sim_tick + 6; pi_link_periodic(); }   // main loop every ~100 us
+        if (!main_stalled && (sim_tick >= next_main)) { next_main = sim_tick + 6; pi_link_periodic(); }   // main loop every ~100 us
         host_drain_tx();
     }
 }
@@ -250,6 +254,7 @@ int main() {
     void *m = mmap((void *)0x400A0000UL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (m != (void *)0x400A0000UL) { perror("mmap"); return 2; }
     for (int i = 0; i < 16; i++) in_r[i] = &readers[i];
+    for (int k = 0; k < 4; k++) st_cfg.mot[k].steps_per_unit = steps_per_unit[k];
     cm1.machine_state = MACHINE_READY;
     pi_link_init();
     run_for(0.01, [](double, float *) { return false; });
@@ -329,6 +334,48 @@ int main() {
     check(llabs((actual_steps(3) - c0) - 600) < 10, "motor 4 held to max_vel");
     host_send(0x12, {});
     run_for(0.2, [](double, float *v) { v[0] = v[1] = v[2] = v[3] = 0; return true; });
+
+    // 6. g2core re-bases the kinematics' step offset mid-session (a shutdown's queue flush does,
+    //    from a runtime position up to 10 ms old): the released position must not move with it
+    puts("6. step offset re-based 3 steps off while the Pi has control");
+    auto zero = [](double, float *v) { v[0] = v[1] = v[2] = v[3] = 0; return true; };
+    auto slow = [](double, float *v) { v[0] = -400; v[1] = v[2] = v[3] = 0; return true; };
+    kn_offset[0] = 4;                       // what g2core had when the Pi took control
+    host_enable();
+    run_for(0.3, slow);
+    kn_offset[0] = 7;
+    run_for(0.1, slow);
+    host_send(0x12, {});
+    run_for(0.2, zero);
+    const float x_expect = (actual_steps(0) - 4) / 200.0f;
+    printf("  released X %.4f, ENABLE position plus steps made %.4f\n", synced_pos[AXIS_X], x_expect);
+    check(fabsf(synced_pos[AXIS_X] - x_expect) < 1e-3f, "released position is the ENABLE position plus the steps made since");
+    kn_offset[0] = 0;
+
+    // 7. E-stop input while the main loop is stalled: the exec interrupt stops the Pi by itself
+    puts("7. E-stop input with the main loop stalled");
+    auto cruise_x = [](double, float *v) { v[0] = 8000; v[1] = v[2] = v[3] = 0; return true; };
+    host_enable();
+    run_for(0.2, cruise_x);
+    main_stalled = true;
+    sim_estop    = true;                    // 300 us: at most one segment's check sees it
+    run_for(0.0003, cruise_x);
+    sim_estop = false;
+    run_for(0.01, cruise_x);
+    check(owner == OWNER_PI, "a 300 us glitch on the E-stop input doesn't stop the Pi");
+    int segs = 0, stop_seg = -1;
+    on_prep = [&](const float *, const float *) { segs++; if ((stop_seg < 0) && (owner == OWNER_STOPPING)) stop_seg = segs; };
+    sim_estop = true;
+    run_for(0.1, cruise_x);
+    on_prep = nullptr;
+    printf("  board stop began at the %d%s segment after the input went active\n", stop_seg, stop_seg == 2 ? "nd" : "th");
+    check((stop_seg > 0) && (stop_seg <= ESTOP_SEGMENTS), "a held E-stop starts the board stop within 2 segments, main loop or not");
+    main_stalled = false;
+    sim_estop    = false;
+    run_for(0.05, zero);
+    { const float z[4] = {0, 0, 0, 0}; host_motion(z); }
+    run_for(0.01, zero);
+    check(last_fb.owner == 0 && last_fb.reason == 3, "control back with USB once the main loop runs, reason E-stop");
 
     printf("\nrx bytes lost %u, bad reply frames %d, feedbacks %d, exec max %u us (host clock, not meaningful)\n",
            lost_rx, bad_tx_frames, feedbacks, diag.exec_max_us);

@@ -62,6 +62,8 @@ inline spDirection spindle_get_direction() { return SPINDLE_OFF; }
 inline float spindle_get_speed() { return 0; }
 struct Reader { bool getState() { return false; } };
 extern Reader *in_r[16];
+#define ESTOP_SWITCH_INPUT 2
+bool gpio_read_input(const uint8_t input_num);
 enum { SR_REQUEST_IMMEDIATE = 0 };
 inline stat_t sr_request_status_report(int) { return STAT_OK; }
 
@@ -124,7 +126,7 @@ enum { PREP_BUFFER_OWNED_BY_LOADER = 0, PREP_BUFFER_OWNED_BY_EXEC = 1 };
 enum { BLOCK_TYPE_NULL = 0, BLOCK_TYPE_ALINE = 1 };
 struct stPrepMotor_t { int64_t substep_increment; int64_t substep_increment_increment; uint8_t direction; int8_t step_sign; };
 struct stPrep_t { volatile int buffer_state; int block_type; void *bf; int32_t dda_ticks; stPrepMotor_t mot[MOTORS]; };
-struct stCfgMotor_t { uint8_t polarity; };
+struct stCfgMotor_t { uint8_t polarity; float steps_per_unit; };
 struct stConfig_t { stCfgMotor_t mot[MOTORS]; };
 extern stPrep_t st_pre;
 extern stConfig_t st_cfg;

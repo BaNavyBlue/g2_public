@@ -371,6 +371,7 @@ constexpr float    DDA_MAX_STEP_RATE = 0.95f * FREQUENCY_DDA;  // the DDA makes 
 constexpr uint32_t STALE_US          = 2000;    // a segment is stale if the newest command is older than this
 constexpr uint32_t EXEC_LOST_US      = 20000;   // no segment prepared for this long while in control: chain lost
 constexpr uint32_t SYNC_PERIOD_US    = 10000;   // how often USB-visible positions follow the step counters
+constexpr uint8_t  ESTOP_SEGMENTS    = 2;       // E-stop input seen active this many segments in a row stops the Pi
 
 enum : uint8_t {
     OWNER_USB      = 0,
@@ -437,8 +438,16 @@ struct {
     float    stop_decel[PI_MOTORS];
 } link_cfg;
 
+// Step counts and positions when the Pi took control. Positions during and after a session are
+// these plus the steps made since, not what the kinematics' step offset gives: g2core code that
+// resets positions while the Pi has control (a shutdown's queue flush) re-bases that offset on a
+// runtime position up to SYNC_PERIOD_US old.
+int32_t ref_counts[PI_MOTORS];
+float   ref_travel[PI_MOTORS];
+
 // exec interrupt state
 float             v_prev[PI_MOTORS];    // end velocity of the last segment prepared, steps/s
+uint8_t           estop_segments = 0;   // segments in a row the E-stop input has read active
 float             stop_v0[PI_MOTORS];
 float             stop_t;
 float             stop_len;
@@ -499,21 +508,30 @@ void read_positions(int32_t pos[MOTORS]) {
 void sync_positions(bool full) {
     int32_t pos[MOTORS];
     read_positions(pos);
-    float steps[MOTORS];
-    for (uint8_t m = 0; m < MOTORS; m++) {
-        steps[m] = (float)pos[m];
-    }
-    float travel[AXES];
-    kn_forward_kinematics(steps, travel);
     for (uint8_t m = 0; m < PI_MOTORS; m++) {
-        const uint8_t axis = motor_axis[m];
+        const uint8_t axis   = motor_axis[m];
+        const float   travel = ref_travel[m] + (float)(pos[m] - ref_counts[m]) / st_cfg.mot[m].steps_per_unit;
         if (full) {
-            cm_set_position_by_axis(axis, travel[axis]);
+            cm_set_position_by_axis(axis, travel);
         } else {
-            cm->gmx.position[axis] = travel[axis];
-            mp_set_runtime_position(axis, travel[axis]);
+            cm->gmx.position[axis] = travel;
+            mp_set_runtime_position(axis, travel);
         }
     }
+}
+
+#if defined(BANTAM) && !defined(ESTOP_SWITCH_INPUT)
+#error "Bantam builds need ESTOP_SWITCH_INPUT for the link's E-stop check"
+#endif
+
+// Exec interrupt only. Read here as well as by the safety manager, which runs from the main loop:
+// that can stall for hundreds of ms while USB prints a long reply.
+bool estop_input_active() {
+#ifdef ESTOP_SWITCH_INPUT
+    return gpio_read_input(ESTOP_SWITCH_INPUT);
+#else
+    return false;
+#endif
 }
 
 // Exec interrupt only. Every motor ramps linearly to zero; all reach it together, at the time the
@@ -700,6 +718,21 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
         link_cfg.stop_decel[m] = getf(p + 24 + 4 * m);
         v_prev[m]         = 0;
     }
+
+    // g2core is idle, so its positions and step counts agree: take them as the session's reference
+    int32_t pos[MOTORS];
+    read_positions(pos);
+    float steps[MOTORS];
+    for (uint8_t m = 0; m < MOTORS; m++) {
+        steps[m] = (float)pos[m];
+    }
+    float travel[AXES];
+    kn_forward_kinematics(steps, travel);
+    for (uint8_t m = 0; m < PI_MOTORS; m++) {
+        ref_counts[m] = pos[m];
+        ref_travel[m] = travel[motor_axis[m]];
+    }
+    estop_segments = 0;
 
     const uint32_t now = board_us();
     for (uint8_t i = 0; i < 2; i++) {
@@ -1052,7 +1085,9 @@ stat_t pi_link_exec_move() {
     const uint32_t       t_prep = board_us();
     const MotionCommand &c      = cmd[cmd_live];
     if (owner == OWNER_PI) {
-        uint8_t reason = stop_request;
+        // Two segments in a row, so a glitch on the input doesn't stop the job
+        estop_segments = estop_input_active() ? (uint8_t)(estop_segments + 1) : 0;
+        uint8_t reason = (estop_segments >= ESTOP_SEGMENTS) ? (uint8_t)REASON_ESTOP : stop_request;
         if ((reason == REASON_NONE) && (us_since(c.rx_us, t0) > (int32_t)link_cfg.watchdog_us)) {
             reason = REASON_WATCHDOG;
             diag.watchdog_trips++;

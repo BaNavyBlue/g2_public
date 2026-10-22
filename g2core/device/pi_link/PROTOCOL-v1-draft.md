@@ -19,10 +19,14 @@ Status:
     The exec time doesn't depend on step rate (92 µs from 2,000 to 40,000 steps/s on one
     motor) but grows about 30 µs per moving motor.
   - **500 µs segments fail the 25% budget** (36-42%); 1000 µs segments pass (18-21%).
-  - Open: the E-stop is only checked from the main loop, which stalled for up to 440 ms
-    while printing `$$` dumps; the DDA timer runs at 61,046.5 Hz (84 MHz / 2 / 688), not
-    61,000, so velocities come out 762 ppm fast; after an E-stop USB's position was 3 steps
-    off the counts.
+  - Fixed after these runs (simulated, not yet flashed): the E-stop was only checked from
+    the main loop, which stalled for up to 440 ms while printing `$$` dumps; after an E-stop
+    USB's position was 3 steps off the counts.
+  - Open: open-loop moves overshoot by about 1 ms of cruise plus about 200 ppm. Not yet
+    explained: Motate sets the DDA timer's RC to 688 (84 MHz / 2 / 61,000 truncated), which
+    is 61,046.5 Hz if the period is RC counts and 60,957.9 Hz if it is RC + 1, and neither
+    fits. Measure the DDA rate against the board clock before correcting anything; the
+    host's position loop absorbs it either way.
 - **Not done:** spindle control over the link, and the door hold.
 
 v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
@@ -99,9 +103,13 @@ as the spindle is off.
 
 When control returns to USB, the board does two things:
 - It folds any steps not yet counted into the step counters.
-- It resets g2core's model, planner and runtime positions from the counters (forward
-  kinematics + `cm_set_position_by_axis()`, as homing does). Without that, the next USB
-  G-code move would start from where g2core last thought the machine was.
+- It resets g2core's model, planner and runtime positions from the counters
+  (`cm_set_position_by_axis()`, as homing does). Without that, the next USB G-code move
+  would start from where g2core last thought the machine was.
+
+Positions are the ones at ENABLE plus the steps made since. They don't go through the
+kinematics' step offset, because g2core code that resets positions while the Pi has control
+(a shutdown's queue flush) re-bases that offset on a runtime position up to 10 ms old.
 
 Homed flags are kept, except after an E-stop (g2core clears them itself).
 
@@ -123,7 +131,7 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 | --- | --- |
 | DISABLE from the host | 1 |
 | Watchdog: no valid MOTION for `watchdog_ms` | 2 |
-| E-stop pressed (g2core also shuts down: spindle off, axes unhomed) | 3 |
+| E-stop pressed (g2core also shuts down: spindle off, axes unhomed). The exec interrupt reads the input itself and stops after 2 segments in a row, so a stalled main loop can't delay it. | 3 |
 | Door opened with the spindle on, and the host didn't stop in time | 4 |
 | g2core alarm, shutdown or panic | 5 |
 | Bad MOTION frame (wrong length, NaN or infinite velocity, spindle request in a build without spindle control) | 6 |
