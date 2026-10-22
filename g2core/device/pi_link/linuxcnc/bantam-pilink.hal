@@ -20,7 +20,7 @@ setp pilink.latency     [PILINK]LATENCY
 
 # Machine on <-> the Pi has control. A refused ENABLE or a board stop shows up as an amp fault.
 net machine-on   motion.motion-enabled => pilink.enable
-net link-fault   pilink.fault => joint.0.amp-fault-in joint.1.amp-fault-in joint.2.amp-fault-in
+net link-fault   pilink.fault => joint.0.amp-fault-in joint.1.amp-fault-in joint.2.amp-fault-in joint.3.amp-fault-in
 
 # X = motor 1 (pilink.0), home switch in1
 setp pilink.0.scale      [JOINT_0]SCALE
@@ -52,7 +52,14 @@ net z-pos-fb   pilink.2.position-fb   => joint.2.motor-pos-fb
 net z-enable   joint.2.amp-enable-out => pilink.2.enable
 net z-home-sw  pilink.input-06        => joint.2.home-sw-in
 
-# Motor 4 (A, not fitted): pilink.3.enable stays unconnected, so it always gets 0 velocity.
+# A = motor 4 (pilink.3), the 4th axis; no home switch (homed in place)
+setp pilink.3.scale      [JOINT_3]SCALE
+setp pilink.3.maxvel     [JOINT_3]STEPGEN_MAXVEL
+setp pilink.3.maxaccel   [JOINT_3]STEPGEN_MAXACCEL
+setp pilink.3.stop-decel [JOINT_3]STOP_DECEL
+net a-pos-cmd  joint.3.motor-pos-cmd  => pilink.3.position-cmd
+net a-pos-fb   pilink.3.position-fb   => joint.3.motor-pos-fb
+net a-enable   joint.3.amp-enable-out => pilink.3.enable
 
 # Probe: in5 closes when the tool touches the bed
 net probe      pilink.input-05 => motion.probe-input
