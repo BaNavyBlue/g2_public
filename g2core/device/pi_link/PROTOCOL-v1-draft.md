@@ -19,9 +19,11 @@ Status:
     The exec time doesn't depend on step rate (92 µs from 2,000 to 40,000 steps/s on one
     motor) but grows about 30 µs per moving motor.
   - **500 µs segments fail the 25% budget** (36-42%); 1000 µs segments pass (18-21%).
-  - Fixed after these runs (simulated, not yet flashed): the E-stop was only checked from
-    the main loop, which stalled for up to 440 ms while printing `$$` dumps; after an E-stop
-    USB's position was 3 steps off the counts.
+  - Fixed after these runs: the E-stop was only checked from the main loop, which stalled
+    for up to 440 ms while printing `$$` dumps; after an E-stop USB's position was 3 steps
+    off the counts. On the machine with 101.17-16-ge2dea and 1000 µs segments, under a `$$`
+    flood (main loop stalled up to 265 ms): the board was stopping 1.96 ms after the E-stop
+    input changed, X moved 5 steps more, and USB's position matched the counts exactly.
   - Open: open-loop moves overshoot by about 1 ms of cruise plus about 200 ppm. Not yet
     explained: Motate sets the DDA timer's RC to 688 (84 MHz / 2 / 61,000 truncated), which
     is 61,046.5 Hz if the period is RC counts and 60,957.9 Hz if it is RC + 1, and neither

@@ -409,6 +409,10 @@ def cmd_move(link, args):
             return v
         return max(0.0, v - a * (t - t_ramp - t_cruise))
 
+    log = None
+    if args.log:
+        log = open(args.log, "w")
+        log.write("t_s,owner,reason,board_us,pos1,pos2,pos3,pos4,inputs,estp\n")
     ser = link.ser
     ser.timeout = 0
     period = 0.001
@@ -441,6 +445,9 @@ def cmd_move(link, args):
             if len(frame) < 8 or zlib.crc32(frame[:-4]) != struct.unpack("<I", frame[-4:])[0] or frame[1] != FEEDBACK:
                 continue
             last = decode_feedback(frame[4:-4])
+            if log:
+                log.write("%.4f,%d,%d,%d,%s,%d,%d\n" % (t, last["owner"], last["reason"], last["time_us"],
+                                                        ",".join(str(p) for p in last["pos"]), last["inputs"], last["estp"]))
             if t - last_print >= 0.25:
                 last_print = t
                 print("%7.3f s  owner %-8s pos %s  (commanded so far %s)"
@@ -453,6 +460,8 @@ def cmd_move(link, args):
         while time.perf_counter() < next_t:
             pass
     ser.timeout = link.timeout_s
+    if log:
+        log.close()
     if not silent:
         fb = request_feedback(link, DISABLE)
     time.sleep(0.2)
@@ -494,6 +503,7 @@ def main():
                    help="board clamp per motor, steps/s (default ~10, 10, 5 mm/s, 11 deg/s)")
     p.add_argument("--stop", choices=["watchdog", "disable"])
     p.add_argument("--segment-us", type=int, default=500, help="board segment length, 500-2000 us")
+    p.add_argument("--log", metavar="FILE", help="write every FEEDBACK as a CSV line")
     p = sub.add_parser("stream")
     p.add_argument("-s", "--seconds", type=float, default=10)
     p.add_argument("--period-ms", type=float, default=1.0)
