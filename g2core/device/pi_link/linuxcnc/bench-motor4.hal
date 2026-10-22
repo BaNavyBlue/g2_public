@@ -1,6 +1,7 @@
-# Bench test: the driver's position loop on motor 4 only (on board 2 nothing is attached to it).
-# X/Y/Z stay disabled and are clamped to 2 steps/s by the driver and by the board.
-#   halrun -U; halrun -f bench-motor4.hal; halrun -U
+# Bench test: the driver's position loop on motor 4 only. Motor 4 must have nothing attached:
+# it moves at 15,000 steps/s. X/Y/Z stay disabled and are clamped to 2 steps/s by the driver and
+# by the board. bench-motor4.sh refuses to take control unless MOTOR4_FREE=1:
+#   halrun -U; MOTOR4_FREE=1 halrun -f bench-motor4.hal; halrun -U
 # ENABLE energizes every motor: afterwards send {"md":0} over USB.
 # Uninstalled module: replace "loadrt pilink" with
 #   loadrt ../../../../home/srjc/p/pilink hal_name=../../../../home/srjc/p/pilink

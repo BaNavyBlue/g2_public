@@ -4,7 +4,9 @@ Status:
 - **Done:** the driver (`pilink.c`) and a slow first machine config for board 2's Desktop CNC
   (`bantam-pilink.ini`, `bantam-pilink.hal`, AXIS).
 - **Bench results (board 2, 2026-10-21, firmware 101.17-13-g3a4d):** everything that works
-  without moving X, Y or Z passes. Motor 4 has no motor attached, so it carried the motion tests.
+  without moving X, Y or Z passes. Motor 4 had no motor attached then, so it carried the motion
+  tests. Since 2026-10-22 the 4th axis is mounted: `bench-motor4.sh` won't take control unless
+  `MOTOR4_FREE=1` says motor 4 is unplugged.
 - **Not done:** LinuxCNC driving X/Y/Z, homing on the real switches, probing, and the board
   E-stop round trip through LinuxCNC. Spindle control isn't in the link yet, so the config
   has no spindle.
