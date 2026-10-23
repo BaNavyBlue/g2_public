@@ -16,7 +16,7 @@ Status:
 | File | What |
 | --- | --- |
 | `pilink.c` | Realtime HAL component, plain C, built with `halcompile` |
-| `bantam-pilink.ini` | Machine config: 10 mm/s on X/Y, 5 mm/s on Z |
+| `bantam-pilink.ini` | Machine config: 20 mm/s on X/Y, 10 mm/s on Z, 20 deg/s on A |
 | `bantam-pilink.hal` | Wiring: joints, home switches, probe, E-stop chain |
 | `tool.tbl` | One tool: the 1/4" probe |
 
