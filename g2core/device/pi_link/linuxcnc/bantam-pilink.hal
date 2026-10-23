@@ -5,6 +5,7 @@ loadrt [KINS]KINEMATICS
 loadrt [EMCMOT]EMCMOT servo_period_nsec=[EMCMOT]SERVO_PERIOD num_joints=[KINS]JOINTS
 loadrt pilink port=[PILINK]PORT baud=[PILINK]BAUD
 loadrt and2 names=estop-and
+loadrt not names=not-homed
 
 # pilink.read first (feedback in), pilink.write last (MOTION out)
 addf pilink.read             servo-thread
@@ -12,6 +13,12 @@ addf motion-command-handler  servo-thread
 addf motion-controller       servo-thread
 addf pilink.write            servo-thread
 addf estop-and               servo-thread
+addf not-homed               servo-thread
+
+# No jogging until Home All: soft limits only apply once homed, and an unhomed jog ran X into its
+# hard stop. Homing doesn't need jogging first; it searches for the switches itself.
+net all-homed  motion.is-all-homed => not-homed.in
+net jog-block  not-homed.out       => motion.jog-inhibit
 
 setp pilink.segment-us  [PILINK]SEGMENT_US
 setp pilink.watchdog-ms [PILINK]WATCHDOG_MS
