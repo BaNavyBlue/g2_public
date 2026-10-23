@@ -1,0 +1,11 @@
+# AXIS user commands for bantam-pilink, loaded through [DISPLAY]USER_COMMAND_FILE after AXIS has
+# set itself up, so its jog functions are in scope.
+#
+# AXIS binds Shift+[ and Shift+] to jog A at full speed, but on a US keyboard those keys arrive as
+# { and }, which nothing binds, so the fast A jog did nothing. Bind them as bind_axis() binds
+# Shift with the other jog keys (A is jog index 3).
+root_window.bind("<KeyPress-braceleft>", lambda e: jog_on_map(3, -get_max_jog_speed_map(3)))
+root_window.bind("<KeyPress-braceright>", lambda e: jog_on_map(3, get_max_jog_speed_map(3)))
+root_window.bind("<KeyRelease-braceleft>", lambda e: jog_off_map(3))
+root_window.bind("<KeyRelease-braceright>", lambda e: jog_off_map(3))
+print("bantam-pilink.axisrc: Shift+[ and Shift+] jog A at full speed", file=sys.stderr)
