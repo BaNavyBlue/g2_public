@@ -109,7 +109,13 @@ typedef struct {
     hal_s32_t   *estp;              /* out */
     hal_s32_t   *safe;              /* out */
     hal_s32_t   *state;             /* out: driver state */
-    hal_float_t *spindle_speed;     /* out */
+    hal_float_t *spindle_speed;     /* out: the board's ramped spindle speed, rpm */
+    hal_bit_t   *spindle_on;        /* in: spindle.0.on */
+    hal_bit_t   *spindle_reverse;   /* in: spindle.0.reverse; the ESC can't reverse */
+    hal_float_t *spindle_speed_cmd; /* in: rpm, spindle.0.speed-out-abs */
+    hal_bit_t   *spindle_at_speed;  /* out: on, and the board's ramped speed within 2% of the command */
+    hal_bit_t   *spindle_waiting;   /* out: the start waits for the ESC to finish booting */
+    hal_bit_t   *spindle_refused;   /* out: the board refused the start; holds until spindle-on drops */
     hal_u32_t   *feedback_age;      /* out: periods since the last FEEDBACK */
     hal_u32_t   *rx_frames;         /* out */
     hal_u32_t   *rx_errors;         /* out: bad COBS, CRC, length or version */
@@ -145,6 +151,7 @@ typedef struct {
     uint16_t fb_seq;                /* seq of the newest MOTION-aligned FEEDBACK */
     int      fb_aligned;            /* fb_seq belongs to this RUNNING session */
     uint8_t  fb_owner;
+    uint8_t  fb_sp_dir;             /* spindle direction the board reports: 0 off, 1 CW */
     uint32_t fb_time;
     int64_t  pi_us;                 /* Pi time, monotonic */
     int64_t  fb_pi_us;              /* Pi time of the newest FEEDBACK */
@@ -260,17 +267,19 @@ static void send_request(pilink_t *d, int type, const uint8_t *payload, int n) {
     d->reply_ready = 0;
 }
 
-static void send_motion(pilink_t *d, const float v[MOTORS], int kind) {
+static void send_motion(pilink_t *d, const float v[MOTORS], int sp_on, float sp_rpm, int kind) {
     uint8_t p[24] = {0};
     for (int i = 0; i < MOTORS; i++) {
         putf(p + 4 * i, v[i]);
     }
+    p[16] = sp_on ? 1 : 0;
+    putf(p + 20, sp_rpm);
     send_frame(d, T_MOTION, p, sizeof(p), kind);
 }
 
 static void send_poll(pilink_t *d) {
     const float zero[MOTORS] = {0};
-    send_motion(d, zero, KIND_OTHER);
+    send_motion(d, zero, 0, 0, KIND_OTHER);
 }
 
 static void send_enable(pilink_t *d) {
@@ -343,6 +352,10 @@ static void handle_feedback(pilink_t *d, uint16_t seq, const uint8_t *p) {
     *d->owner          = p[1];
     *d->release_reason = p[2];
     *d->hold_request   = (p[3] & 1) != 0;
+    if (p[3] & 0x10) {
+        *d->spindle_refused = 1;
+    }
+    *d->spindle_waiting = (p[3] & 0x20) != 0;
     if (p[3] & 2) {
         (*d->clamped)++;
     }
@@ -357,6 +370,7 @@ static void handle_feedback(pilink_t *d, uint16_t seq, const uint8_t *p) {
     for (int i = 0; i < INPUTS; i++) {
         *d->input[i] = (in >> i) & 1;
     }
+    d->fb_sp_dir      = p[32];
     *d->board_state   = p[33];
     *d->spindle_speed = getf(p + 36);
 
@@ -422,6 +436,11 @@ static void pilink_read(void *arg, long period) {
     *d->feedback_age = d->age;
     *d->link_ok      = d->have_fb && (d->age < LINK_LOST_PERIODS);
     *d->estop_ok     = *d->link_ok && (*d->estp == 0) && !alarmed(*d->board_state) && !*d->position_lost;
+    if (!*d->spindle_on) {
+        *d->spindle_refused = 0;
+    }
+    *d->spindle_at_speed = *d->spindle_on && (d->fb_sp_dir == 1) &&
+                           (*d->spindle_speed >= 0.98 * *d->spindle_speed_cmd);
     for (int i = 0; i < MOTORS; i++) {
         motor_t *m = &d->m[i];
         *m->counts      = (int32_t)m->count_acc;
@@ -429,10 +448,16 @@ static void pilink_read(void *arg, long period) {
     }
 }
 
+static const char *reason_name(int r) {
+    static const char *names[] = {"none", "DISABLE", "watchdog", "E-stop", "door opened with the spindle on",
+                                  "alarm", "bad frame", "USB stop", "segment chain lost"};
+    return ((r >= 0) && (r < (int)(sizeof(names) / sizeof(names[0])))) ? names[r] : "unknown";
+}
+
 static void set_fault(pilink_t *d, int result, const char *why) {
     if (!*d->fault) {
-        rtapi_print_msg(RTAPI_MSG_ERR, "pilink: %s (result %d, owner %d, release reason %d)\n",
-                        why, result, *d->owner, *d->release_reason);
+        rtapi_print_msg(RTAPI_MSG_ERR, "pilink: %s (result %d, owner %d, release reason %d: %s)\n",
+                        why, result, *d->owner, *d->release_reason, reason_name(*d->release_reason));
     }
     *d->fault = 1;
     if (result) {
@@ -526,7 +551,15 @@ static void run_motion(pilink_t *d) {
         v[i]             = (float)vel;
         *m->velocity_cmd = (s != 0) ? vel / s : 0;
     }
-    send_motion(d, v, KIND_MOTION);
+    int sp_on = *d->spindle_on;
+    if (sp_on && *d->spindle_reverse) {
+        set_fault(d, 0, "M4: the spindle can't run in reverse");
+        sp_on = 0;
+    }
+    if (sp_on && *d->spindle_refused) {
+        set_fault(d, 0, "the board refused the spindle start: door open, E-stop or alarm");
+    }
+    send_motion(d, v, sp_on, sp_on ? (float)*d->spindle_speed_cmd : 0.0f, KIND_MOTION);
 }
 
 static void zero_outputs(pilink_t *d) {
@@ -779,6 +812,12 @@ int rtapi_app_main(void) {
     PIN(hal_pin_s32_newf  (HAL_OUT, &d->safe,           comp_id, "pilink.safe"));
     PIN(hal_pin_s32_newf  (HAL_OUT, &d->state,          comp_id, "pilink.state"));
     PIN(hal_pin_float_newf(HAL_OUT, &d->spindle_speed,  comp_id, "pilink.spindle-speed"));
+    PIN(hal_pin_bit_newf  (HAL_IN,  &d->spindle_on,        comp_id, "pilink.spindle-on"));
+    PIN(hal_pin_bit_newf  (HAL_IN,  &d->spindle_reverse,   comp_id, "pilink.spindle-reverse"));
+    PIN(hal_pin_float_newf(HAL_IN,  &d->spindle_speed_cmd, comp_id, "pilink.spindle-speed-cmd"));
+    PIN(hal_pin_bit_newf  (HAL_OUT, &d->spindle_at_speed,  comp_id, "pilink.spindle-at-speed"));
+    PIN(hal_pin_bit_newf  (HAL_OUT, &d->spindle_waiting,   comp_id, "pilink.spindle-waiting"));
+    PIN(hal_pin_bit_newf  (HAL_OUT, &d->spindle_refused,   comp_id, "pilink.spindle-refused"));
     PIN(hal_pin_u32_newf  (HAL_OUT, &d->feedback_age,   comp_id, "pilink.feedback-age"));
     PIN(hal_pin_u32_newf  (HAL_OUT, &d->rx_frames,      comp_id, "pilink.rx-frames"));
     PIN(hal_pin_u32_newf  (HAL_OUT, &d->rx_errors,      comp_id, "pilink.rx-errors"));

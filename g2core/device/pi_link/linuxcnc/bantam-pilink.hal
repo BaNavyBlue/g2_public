@@ -71,6 +71,13 @@ net a-enable   joint.3.amp-enable-out => pilink.3.enable
 # Probe: in5 closes when the tool touches the bed
 net probe      pilink.input-05 => motion.probe-input
 
+# Spindle (M3/M5 and S) through the link to the board's ESC. The board refuses a start with the
+# door open or the E-stop down, and stops it at any board stop; M4 turns the machine off.
+net spindle-on     spindle.0.on            => pilink.spindle-on
+net spindle-rev    spindle.0.reverse       => pilink.spindle-reverse
+net spindle-rpm    spindle.0.speed-out-abs => pilink.spindle-speed-cmd
+net spindle-ready  pilink.spindle-at-speed => spindle.0.at-speed
+
 # E-stop: LinuxCNC's chain AND the board (link up, E-stop clear and acknowledged, no alarm).
 # An E-stop reset (F1) also acknowledges and clears the board's E-stop over the link.
 net estop-user   iocontrol.0.user-enable-out    => estop-and.in0
