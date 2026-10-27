@@ -34,7 +34,7 @@ Home All (Z first, then X and Y), and jog.
 - Don't run `pi_link_test.py` while LinuxCNC is running: both use `/dev/ttyAMA0`.
 - Without installing: rtapi_app only loads modules from its own directory, and `halcmd`
   waits for a component named like the module argument. With a symlink `~/p` to the config
-  directory, `loadrt ../../../../home/srjc/p/pilink hal_name=../../../../home/srjc/p/pilink`
+  directory, `loadrt ../../../../home/<user>/p/pilink hal_name=../../../../home/<user>/p/pilink`
   works. The bench tests used this.
 
 ## How it works

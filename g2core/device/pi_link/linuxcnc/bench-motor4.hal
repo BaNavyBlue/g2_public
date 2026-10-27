@@ -4,7 +4,7 @@
 #   halrun -U; MOTOR4_FREE=1 halrun -f bench-motor4.hal; halrun -U
 # ENABLE energizes every motor: afterwards send {"md":0} over USB.
 # Uninstalled module: replace "loadrt pilink" with
-#   loadrt ../../../../home/srjc/p/pilink hal_name=../../../../home/srjc/p/pilink
+#   loadrt ../../../../home/<user>/p/pilink hal_name=../../../../home/<user>/p/pilink
 
 loadrt threads name1=servo-thread period1=1000000
 loadrt pilink
