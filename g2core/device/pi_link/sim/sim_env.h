@@ -13,6 +13,8 @@ typedef uint8_t stat_t;
 #define AXES 9
 #define FREQUENCY_DDA 61000UL
 #define DDA_SUBSTEPS (INT64_MAX-100)
+#define EPSILON ((float)0.00001)
+#define fp_NE(a,b) (std::abs(a-b) > EPSILON)
 enum { AXIS_X = 0, AXIS_Y, AXIS_Z, AXIS_U, AXIS_V, AXIS_W, AXIS_A, AXIS_B, AXIS_C };
 enum { DIRECTION_CW = 0, DIRECTION_CCW = 1 };
 
@@ -23,7 +25,9 @@ enum { CYCLE_NONE = 0 };
 enum { FEEDHOLD_OFF = 0 };
 enum { COMBINED_READY = 1, COMBINED_RUN = 5 };
 struct GCodeStateX { float position[AXES]; };
-struct cmMachine_t { cmMachineState machine_state; int cycle_type; int hold_state; bool homed[AXES]; GCodeStateX gmx; };
+enum spDirection { SPINDLE_OFF = 0, SPINDLE_CW = 1, SPINDLE_CCW = 2 };
+struct GCodeState_t { spDirection spindle_direction; float spindle_speed; };
+struct cmMachine_t { cmMachineState machine_state; int cycle_type; int hold_state; bool homed[AXES]; GCodeStateX gmx; GCodeState_t gm; };
 extern cmMachine_t cm1;
 extern cmMachine_t *cm;
 #define ACTIVE_MODEL 0
@@ -57,12 +61,15 @@ extern enEncoders_t en;
 void kn_forward_kinematics(const float steps[], float travel[]);
 
 // spindle, gpio, report
-enum spDirection { SPINDLE_OFF = 0 };
-inline spDirection spindle_get_direction() { return SPINDLE_OFF; }
-inline float spindle_get_speed() { return 0; }
+// spindle: modelled in motion_sim.cpp
+spDirection spindle_get_direction();
+float spindle_get_speed();
+void spindle_engage(const GCodeState_t &gm);
+void spindle_stop();
 struct Reader { bool getState() { return false; } };
 extern Reader *in_r[16];
 #define ESTOP_SWITCH_INPUT 2
+#define INTERLOCK_SWITCH_INPUT 4
 bool gpio_read_input(const uint8_t input_num);
 enum { SR_REQUEST_IMMEDIATE = 0 };
 inline stat_t sr_request_status_report(int) { return STAT_OK; }
@@ -130,3 +137,19 @@ struct stCfgMotor_t { uint8_t polarity; float steps_per_unit; };
 struct stConfig_t { stCfgMotor_t mot[MOTORS]; };
 extern stPrep_t st_pre;
 extern stConfig_t st_cfg;
+
+// Bantam safety manager: the sim sets the door, E-stop and ESC states directly
+struct SafetyManager {
+    virtual bool ok_to_spindle() { return true; }
+};
+struct BantamSafetyManager : SafetyManager {
+    uint8_t estop         = 0;
+    bool    door_open     = false;
+    bool    esc_not_ready = false;
+    bool    ok_to_spindle() override { return (estop == 0) && !door_open && !esc_not_ready; }
+    uint8_t get_estop_state() { return estop; }
+    bool    get_interlock_safety_state() { return door_open; }
+    bool    get_esc_safety_state() { return esc_not_ready; }
+    void    ack_estop() {}
+};
+extern SafetyManager *safety_manager;

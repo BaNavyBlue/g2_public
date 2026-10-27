@@ -57,8 +57,21 @@ void kn_forward_kinematics(const float steps[], float travel[]) {
     for (int a = 0; a < AXES; a++) travel[a] = 0;
     for (int m = 0; m < 4; m++) travel[axis_of[m]] = (steps[m] - kn_offset[m]) / steps_per_unit[m];
 }
-static bool sim_estop = false;
-bool gpio_read_input(const uint8_t input_num) { return (input_num == ESTOP_SWITCH_INPUT) && sim_estop; }
+static bool sim_estop = false, sim_door = false;
+bool gpio_read_input(const uint8_t input_num) {
+    return ((input_num == ESTOP_SWITCH_INPUT) && sim_estop) || ((input_num == INTERLOCK_SWITCH_INPUT) && sim_door);
+}
+
+// ---- spindle and safety manager ----
+static spDirection sp_dir   = SPINDLE_OFF;
+static float       sp_speed = 0;
+spDirection spindle_get_direction() { return sp_dir; }
+float spindle_get_speed() { return sp_speed; }
+void spindle_engage(const GCodeState_t &gm) { sp_dir = gm.spindle_direction; sp_speed = gm.spindle_speed; }
+void spindle_stop() { sp_dir = SPINDLE_OFF; sp_speed = 0; cm->gm.spindle_direction = SPINDLE_OFF; cm->gm.spindle_speed = 0; }
+BantamSafetyManager  sim_bsm;
+BantamSafetyManager *bsm            = &sim_bsm;
+SafetyManager       *safety_manager = &sim_bsm;
 
 // ---- the real lean prep, wrapped to record what each segment intends ----
 #define st_prep_velocity_segment st_prep_velocity_segment_real
@@ -192,15 +205,16 @@ static void host_enable(float decel_scale = 1.0f) {
     p.resize(52, 0);
     host_send(0x10, p);
 }
-static void host_motion(const float v[4]) {
+static void host_motion(const float v[4], uint8_t sp_on = 0, float sp_rpm = 0) {
     std::vector<uint8_t> p;
     for (int m = 0; m < 4; m++) put<float>(p, v[m]);
-    put<uint8_t>(p, 0); put<uint8_t>(p, 0); put<uint16_t>(p, 0); put<float>(p, 0.0f);
+    put<uint8_t>(p, sp_on); put<uint8_t>(p, 0); put<uint16_t>(p, 0); put<float>(p, sp_rpm);
     host_send(0x11, p);
 }
 struct Feedback { uint8_t result, owner, reason, flags; };
 static Feedback last_fb{};
 static int bad_tx_frames = 0, feedbacks = 0;
+static uint8_t fb_flags_seen = 0;     // FEEDBACK flags ORed together since last cleared
 static std::vector<uint8_t> tx_acc;
 static void host_drain_tx() {
     Pdc *p = pdc();
@@ -217,7 +231,7 @@ static void host_drain_tx() {
                 ok = crc == crc32(0, fr.data(), fr.size() - 4);
             }
             if (!ok) { bad_tx_frames++; continue; }
-            if (fr[1] == 0x91) { last_fb = {fr[4], fr[5], fr[6], fr[7]}; feedbacks++; }
+            if (fr[1] == 0x91) { last_fb = {fr[4], fr[5], fr[6], fr[7]}; fb_flags_seen |= fr[7]; feedbacks++; }
         }
         p->PERIPH_TPR += p->PERIPH_TCR;
         p->PERIPH_TCR = 0;
@@ -227,6 +241,8 @@ static void host_drain_tx() {
 
 // ---- run the machine for a while; profile(t_s, v) fills velocities or returns false to stay silent ----
 static bool main_stalled = false;           // the main loop is busy elsewhere (a long USB reply)
+static uint8_t sim_sp_on = 0;               // the host's spindle request, sent with every MOTION
+static float   sim_sp_rpm = 0;
 static void run_for(double seconds, std::function<bool(double, float *)> profile) {
     const uint64_t end = sim_tick + (uint64_t)(seconds * 61000.0);
     double next_frame_us = now_us();
@@ -239,7 +255,7 @@ static void run_for(double seconds, std::function<bool(double, float *)> profile
         if (now_us() >= next_frame_us) {
             next_frame_us += 1000.0;
             float v[4];
-            if (profile(now_us() / 1e6, v)) host_motion(v);
+            if (profile(now_us() / 1e6, v)) host_motion(v, sim_sp_on, sim_sp_rpm);
         }
         if (usart_pending && usart_enabled) { usart_pending = false; USART2_Handler(); }
         if (!main_stalled && (sim_tick >= next_main)) { next_main = sim_tick + 6; pi_link_periodic(); }   // main loop every ~100 us
@@ -376,6 +392,99 @@ int main() {
     { const float z[4] = {0, 0, 0, 0}; host_motion(z); }
     run_for(0.01, zero);
     check(last_fb.owner == 0 && last_fb.reason == 3, "control back with USB once the main loop runs, reason E-stop");
+
+    // 8. Spindle on, new speed, off
+    puts("8. spindle on, new speed and off through MOTION");
+    host_enable();
+    run_for(0.05, zero);
+    sim_sp_on  = 1;
+    sim_sp_rpm = 12000;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_CW && sp_speed == 12000, "spindle on at 12000 rpm");
+    sim_sp_rpm = 20000;
+    run_for(0.05, zero);
+    check(sp_speed == 20000, "a new speed is applied while it runs");
+    sim_sp_on = 0;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_OFF, "off");
+
+    // 9. Never starts by itself
+    puts("9. once something else stops the spindle it stays off until the host asks again");
+    sim_sp_on  = 1;
+    sim_sp_rpm = 15000;
+    run_for(0.05, zero);
+    spindle_stop();                         // as the safety manager does for the door or E-stop
+    run_for(0.05, zero);
+    sim_sp_rpm = 16000;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_OFF, "a new speed alone doesn't restart it");
+    sim_sp_on = 0;
+    run_for(0.02, zero);
+    sim_sp_on = 1;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_CW && sp_speed == 16000, "off then on starts it again");
+
+    // 10. Waiting for the ESC
+    puts("10. a start while the ESC boots waits for it, then starts");
+    sim_sp_on = 0;
+    run_for(0.02, zero);
+    sim_bsm.esc_not_ready = true;
+    fb_flags_seen         = 0;
+    sim_sp_on             = 1;
+    sim_sp_rpm            = 10000;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_OFF && (fb_flags_seen & 0x20), "waiting, and FEEDBACK says so");
+    sim_bsm.esc_not_ready = false;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_CW, "starts once the ESC is ready");
+
+    // 11. Door opens with the spindle on, main loop stalled
+    puts("11. door opened with the spindle on and the main loop stalled");
+    run_for(0.2, cruise_x);
+    main_stalled = true;
+    segs         = 0;
+    stop_seg     = -1;
+    on_prep = [&](const float *, const float *) { segs++; if ((stop_seg < 0) && (owner == OWNER_STOPPING)) stop_seg = segs; };
+    sim_door          = true;
+    sim_bsm.door_open = true;
+    run_for(0.1, cruise_x);
+    on_prep = nullptr;
+    printf("  board stop began at segment %d after the door opened\n", stop_seg);
+    check((stop_seg > 0) && (stop_seg <= DOOR_SEGMENTS), "the board stop starts within 2 segments, main loop or not");
+    main_stalled = false;
+    run_for(0.05, zero);
+    { const float z[4] = {0, 0, 0, 0}; host_motion(z); }
+    run_for(0.01, zero);
+    check(last_fb.owner == 0 && last_fb.reason == 4, "control back with USB, reason door");
+    check(sp_dir == SPINDLE_OFF, "spindle off after the stop");
+    sim_sp_on = 0;
+
+    // 12. Door open with the spindle off: allowed
+    puts("12. an open door with the spindle off doesn't stop motion");
+    host_enable();
+    run_for(0.2, cruise_x);
+    check(owner == OWNER_PI, "still moving with the door open");
+    sim_door          = false;
+    sim_bsm.door_open = false;
+
+    // 13. DISABLE with the spindle on
+    puts("13. DISABLE hands back with the spindle off");
+    sim_sp_on  = 1;
+    sim_sp_rpm = 12000;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_CW, "spindle on");
+    host_send(0x12, {});
+    run_for(0.1, zero);
+    check(last_fb.owner == 0 && sp_dir == SPINDLE_OFF, "back with USB, spindle off");
+    sim_sp_on = 0;
+
+    // 14. Reverse is refused
+    puts("14. a reverse (CCW) request is a bad frame");
+    host_enable();
+    run_for(0.02, zero);
+    { const float z[4] = {0, 0, 0, 0}; host_motion(z, 2, 10000); }
+    run_for(0.1, zero);
+    check(last_fb.owner == 0 && last_fb.reason == 6 && sp_dir == SPINDLE_OFF, "control back with USB, reason bad frame, spindle off");
 
     printf("\nrx bytes lost %u, bad reply frames %d, feedbacks %d, exec max %u us (host clock, not meaningful)\n",
            lost_rx, bad_tx_frames, feedbacks, diag.exec_max_us);

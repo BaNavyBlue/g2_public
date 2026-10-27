@@ -29,7 +29,9 @@ Status:
     is 61,046.5 Hz if the period is RC counts and 60,957.9 Hz if it is RC + 1, and neither
     fits. Measure the DDA rate against the board clock before correcting anything; the
     host's position loop absorbs it either way.
-- **Not done:** spindle control over the link, and the door hold.
+- **Spindle control (phase A):** in the firmware and the host simulation, not yet run on the
+  machine. An open door with the spindle wanted stops the board (reason 4).
+- **Not done:** the resumable door hold (phase B, below).
 
 v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
 version stays 0 until v1 ships.
@@ -126,15 +128,15 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
   3.5 mm.
 - The ramp ends with one all-zero segment. Loading that segment folds the last moving
   segment's steps into the counters.
-- Spindle (once spindle control is in): stopped at the start of every board stop, except
-  DISABLE, where the spindle is the host's responsibility.
+- Spindle: stopped by every board stop and handback, DISABLE included, so turning LinuxCNC's
+  machine off also stops it.
 
 | Trigger | Reason code |
 | --- | --- |
 | DISABLE from the host | 1 |
 | Watchdog: no valid MOTION for `watchdog_ms` | 2 |
 | E-stop pressed (g2core also shuts down: spindle off, axes unhomed). The exec interrupt reads the input itself and stops after 2 segments in a row, so a stalled main loop can't delay it. | 3 |
-| Door opened with the spindle on, and the host didn't stop in time | 4 |
+| Door opened while the host wants the spindle on. The exec interrupt reads the door switch and stops after 2 segments in a row (phase A; phase B turns this into a hold, below). | 4 |
 | g2core alarm, shutdown or panic | 5 |
 | Bad MOTION frame (wrong length, NaN or infinite velocity, spindle request in a build without spindle control) | 6 |
 | USB `!`, `%` or ^D | 7 |
@@ -142,7 +144,16 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 
 ## Door interlock while the Pi has control
 
-Not in the bench build: it needs spindle control over the link.
+**Phase A (built):** the door switch is read by the exec interrupt, like the E-stop.
+
+- **Spindle off:** reported only (`safe` bit 0), as in stock firmware. Motion with the door
+  open is allowed.
+- **Spindle wanted** (the host's newest MOTION asks for it): the board stops (reason 4) once
+  the door has read open for 2 segments, whatever the main loop is doing. The safety manager
+  stops the spindle at once and cuts the ESC's power 0.9 s later, as in stock firmware. The job
+  ends.
+
+**Phase B (planned):** the resumable hold the user asked for, replacing the stop above:
 
 - **Spindle off:** reported only (`safe` bit 0), as in stock firmware.
 - **Spindle on:**
@@ -241,12 +252,23 @@ The watchdog starts at ENABLE: the first MOTION is due within `watchdog_ms`.
 | Offset | Type | Field |
 | --- | --- | --- |
 | 0 | f32 x4 | velocity, steps/s per motor |
-| 16 | u8 | spindle: 0 off, 1 CW (M3), 2 CCW (M4). Must be 0 until spindle control is in. |
+| 16 | u8 | spindle: 0 off, 1 on (CW, M3). 2 (CCW, M4) is a bad frame: the ESC can't reverse, and Bantam's software doesn't support M4 either. Bench builds take only 0. |
 | 17 | u8 | reserved, 0 |
 | 18 | u16 | reserved for digital outputs, 0 |
-| 20 | f32 | spindle speed, RPM |
+| 20 | f32 | spindle speed, RPM, finite and >= 0. Bantam's ESC curve clamps it to 10,000-28,000. |
 
-Spindle requests will go through the same ESC toolhead code and safety checks as M3/M4/M5.
+Spindle requests go through the same ESC code as M3/M5 (`spindle_engage()`), from the main loop:
+
+- **A start is an off-to-on change** of the request. It needs the safety manager's
+  `ok_to_spindle()`: E-stop clear, door closed, ESC ready, no alarm. If only the ESC is still
+  booting (door closed, E-stop clear), the start waits for it (FEEDBACK bit 5), as M3 does in
+  stock firmware. Otherwise it's refused (FEEDBACK bit 4) and stays off.
+- **The spindle never starts by itself.** Once the safety manager or a board stop has stopped
+  it, it stays off until the host sends off and then on again.
+- A new speed while it runs is applied at once. FEEDBACK reports the ESC's ramped speed
+  (7 rpm/ms, so 0 to 10,000 takes about 1.4 s); the host decides when it's at speed.
+- While the Pi has control a spin-up doesn't hold the step loader (`is_a_toolhead_busy()` is
+  false), which would otherwise stall the segment chain.
 
 ### 0x12 DISABLE (host -> board), no payload
 
@@ -285,7 +307,7 @@ Counters reset at each ENABLE.
 | 0 | u8 | `result` for the request answered: 0 ok, else a reason (table below) |
 | 1 | u8 | owner: 0 USB, 1 PI, 2 STOPPING |
 | 2 | u8 | last release reason (board stop table), 0 = none since the last ENABLE |
-| 3 | u8 | flags: bit0 `hold_request`, bit1 velocity clamped, bit2 stale segment (both since the last FEEDBACK), bit3 motion locked (bench build) |
+| 3 | u8 | flags: bit0 `hold_request`, bit1 velocity clamped, bit2 stale segment (both since the last FEEDBACK), bit3 motion locked (bench build), bit4 spindle start refused (since the last FEEDBACK), bit5 spindle start waiting for the ESC |
 | 4 | u32 | board time, µs (wraps after about 71 minutes) |
 | 8 | i32 x4 | position: steps emitted per motor at that time (wraps; the driver unwraps) |
 | 24 | u16 | seq of the newest MOTION taken into a segment |
@@ -317,6 +339,7 @@ Counters reset at each ENABLE.
 | `alarm.cpp` | `cm_is_alarmed()` returns 106 while the Pi has control. It gates every USB setting, JSON write and G-code block. |
 | `controller.cpp` | `!`, `%`, ^D and `~` handling while the Pi has control. |
 | `canonical_machine.cpp` | `cm_get_combined_state()` reports RUN while the Pi has control. |
+| `spindle.cpp` | `is_a_toolhead_busy()` is false while the Pi has control, so a spin-up doesn't hold the step loader. |
 | `device/pi_link/pi_link.cpp` | Everything else. |
 
 A build without `PI_LINK` is unchanged: same size, same behaviour.

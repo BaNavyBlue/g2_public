@@ -45,6 +45,7 @@
 #include "encoder.h"
 #include "kinematics.h"
 #include "spindle.h"
+#include "safety_manager.h"
 #include "gpio.h"
 #include "report.h"
 #include "pi_link.h"
@@ -372,6 +373,8 @@ constexpr uint32_t STALE_US          = 2000;    // a segment is stale if the new
 constexpr uint32_t EXEC_LOST_US      = 20000;   // no segment prepared for this long while in control: chain lost
 constexpr uint32_t SYNC_PERIOD_US    = 10000;   // how often USB-visible positions follow the step counters
 constexpr uint8_t  ESTOP_SEGMENTS    = 2;       // E-stop input seen active this many segments in a row stops the Pi
+constexpr uint8_t  DOOR_SEGMENTS     = 2;       // door seen open this many segments in a row, spindle wanted: stop
+constexpr uint8_t  SPINDLE_REQUEST_MAX = PI_LINK_MOTION ? 1 : 0;   // 1 = on (CW); the ESC can't reverse
 
 enum : uint8_t {
     OWNER_USB      = 0,
@@ -406,6 +409,8 @@ enum : uint8_t {    // FEEDBACK flags
     FB_CLAMPED       = 0x02,
     FB_STALE         = 0x04,
     FB_MOTION_LOCKED = 0x08,
+    FB_SPINDLE_REFUSED = 0x10,  // a spindle start was refused (door open, E-stop, alarm)
+    FB_SPINDLE_WAITING = 0x20,  // a spindle start is waiting for the ESC to finish booting
 };
 
 // The Desktop CNC maps motors 1-4 to these axes
@@ -448,6 +453,17 @@ float   ref_travel[PI_MOTORS];
 // exec interrupt state
 float             v_prev[PI_MOTORS];    // end velocity of the last segment prepared, steps/s
 uint8_t           estop_segments = 0;   // segments in a row the E-stop input has read active
+uint8_t           door_segments  = 0;   // segments in a row the door has read open while the spindle is wanted
+
+// Spindle. The link interrupt records each MOTION's request; the main loop acts on changes to
+// it (spindle_periodic), since the ESC code runs from there.
+volatile uint8_t sp_req_on     = 0;     // newest request: 0 off, 1 on (CW)
+volatile float   sp_req_rpm    = 0;
+uint8_t          sp_seen_on    = 0;     // the request the main loop last acted on
+float            sp_seen_rpm   = 0;
+bool             sp_running    = false; // the link has the spindle on
+volatile bool    sp_waiting    = false; // a start is waiting for the ESC to finish booting
+volatile bool    fb_sp_refused = false; // set by the main loop, cleared by the next FEEDBACK
 float             stop_v0[PI_MOTORS];
 float             stop_t;
 float             stop_len;
@@ -520,9 +536,18 @@ void sync_positions(bool full) {
     }
 }
 
-#if defined(BANTAM) && !defined(ESTOP_SWITCH_INPUT)
-#error "Bantam builds need ESTOP_SWITCH_INPUT for the link's E-stop check"
+#if defined(BANTAM) && (!defined(ESTOP_SWITCH_INPUT) || !defined(INTERLOCK_SWITCH_INPUT))
+#error "Bantam builds need ESTOP_SWITCH_INPUT and INTERLOCK_SWITCH_INPUT for the link's E-stop and door checks"
 #endif
+
+// Exec interrupt only, like estop_input_active()
+bool door_input_active() {
+#ifdef INTERLOCK_SWITCH_INPUT
+    return gpio_read_input(INTERLOCK_SWITCH_INPUT);
+#else
+    return false;
+#endif
+}
 
 // Exec interrupt only. Read here as well as by the safety manager, which runs from the main loop:
 // that can stall for hundreds of ms while USB prints a long reply.
@@ -555,6 +580,8 @@ void request_stop(uint8_t reason) {
     }
 }
 
+void spindle_off();
+
 // Main loop only, once the board stop has finished and the steppers are idle
 void release_to_usb() {
     const uint32_t primask = __get_PRIMASK();
@@ -566,6 +593,7 @@ void release_to_usb() {
     __set_PRIMASK(primask);
 
     sync_positions(true);
+    spindle_off();
     stop_done    = false;
     owner        = OWNER_USB;
     isr_reads_rx = false;       // the segment chain has ended, so the main loop can read again
@@ -611,13 +639,16 @@ void send_feedback(uint16_t seq, uint8_t result) {
     __disable_irq();
     const bool stale = fb_stale;
     fb_stale         = false;
+    const bool refused = fb_sp_refused;
+    fb_sp_refused      = false;
     __set_PRIMASK(primask);
 
     uint8_t p[40] = {};
     p[0] = result;
     p[1] = owner;
     p[2] = release_reason;
-    p[3] = (fb_clamped ? FB_CLAMPED : 0) | (stale ? FB_STALE : 0) | (PI_LINK_MOTION ? 0 : FB_MOTION_LOCKED);
+    p[3] = (fb_clamped ? FB_CLAMPED : 0) | (stale ? FB_STALE : 0) | (PI_LINK_MOTION ? 0 : FB_MOTION_LOCKED) |
+           (refused ? FB_SPINDLE_REFUSED : 0) | (sp_waiting ? FB_SPINDLE_WAITING : 0);
     fb_clamped = false;
     put32(p + 4, board_us());
     int32_t pos[MOTORS];
@@ -733,6 +764,14 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
         ref_travel[m] = travel[motor_axis[m]];
     }
     estop_segments = 0;
+    door_segments  = 0;
+    sp_req_on      = 0;     // ENABLE needs the spindle off, so the session starts with it off
+    sp_req_rpm     = 0;
+    sp_seen_on     = 0;
+    sp_seen_rpm    = 0;
+    sp_running     = false;
+    sp_waiting     = false;
+    fb_sp_refused  = false;
 
     const uint32_t now = board_us();
     for (uint8_t i = 0; i < 2; i++) {
@@ -773,7 +812,9 @@ void handle_motion(uint16_t seq, const uint8_t *p, uint16_t len) {
         send_feedback(seq, RESULT_NOT_IN_CONTROL);
         return;
     }
-    bool valid = (len == 24) && (p[16] == 0);   // no spindle control over the link yet
+    const uint8_t sp_on  = p[16];
+    const float   sp_rpm = getf(p + 20);
+    bool valid = (len == 24) && (sp_on <= SPINDLE_REQUEST_MAX) && isfinite(sp_rpm) && (sp_rpm >= 0);
     float vel[PI_MOTORS];
     for (uint8_t m = 0; m < PI_MOTORS; m++) {
         vel[m] = getf(p + 4 * m);
@@ -803,6 +844,8 @@ void handle_motion(uint16_t seq, const uint8_t *p, uint16_t len) {
     c.rx_us = board_us();
     __asm__ volatile("dmb" ::: "memory");
     cmd_live ^= 1;
+    sp_req_rpm = sp_rpm;
+    sp_req_on  = sp_on;
     send_feedback(seq, RESULT_OK);
 }
 
@@ -843,6 +886,80 @@ void handle_safety(uint16_t seq, const uint8_t *p, uint16_t len) {
     send_feedback(seq, RESULT_OK);
 }
 
+// ---- spindle (main loop only) ----
+
+void spindle_on(float rpm) {
+    GCodeState_t gm          = cm->gm;   // engage() takes a G-code model; only the spindle fields matter
+    gm.spindle_direction     = SPINDLE_CW;
+    gm.spindle_speed         = rpm;
+    cm->gm.spindle_direction = SPINDLE_CW;   // so USB status reports show it
+    cm->gm.spindle_speed     = rpm;
+    spindle_engage(gm);
+    sp_running = true;
+}
+
+void spindle_off() {
+    sp_waiting = false;
+    if (spindle_get_direction() != SPINDLE_OFF) {
+        spindle_stop();
+    }
+    sp_running = false;
+}
+
+// Nothing in the way of a start but the ESC finishing its boot (door closed, E-stop clear, no
+// alarm): the start waits for it, as M3 does in stock firmware.
+bool spindle_esc_booting() {
+#ifdef BANTAM
+    return bsm && (bsm->get_estop_state() == 0) && !bsm->get_interlock_safety_state() &&
+           bsm->get_esc_safety_state() && !machine_alarmed();
+#else
+    return false;
+#endif
+}
+
+// Starts only on an off-to-on change of the host's request, so the spindle never starts by itself:
+// after the safety manager stops it (door, E-stop), it stays off until the host asks again.
+void spindle_periodic() {
+    if (sp_running && (spindle_get_direction() == SPINDLE_OFF)) {
+        sp_running = false;     // stopped by the safety manager or a shutdown
+    }
+    if (owner != OWNER_PI) {
+        spindle_off();          // every board stop ends the spindle
+        return;
+    }
+    const uint8_t on      = sp_req_on;
+    const float   rpm     = sp_req_rpm;
+    const bool    start   = on && !sp_seen_on;
+    const bool    changed = (on != sp_seen_on) || fp_NE(rpm, sp_seen_rpm);
+    sp_seen_on  = on;
+    sp_seen_rpm = rpm;
+
+    if (!on) {
+        spindle_off();
+        return;
+    }
+    if (start) {
+        if (safety_manager->ok_to_spindle()) {
+            spindle_on(rpm);
+        } else if (spindle_esc_booting()) {
+            sp_waiting = true;
+        } else {
+            fb_sp_refused = true;
+        }
+    } else if (changed && sp_running) {
+        spindle_on(rpm);        // a new speed
+    }
+    if (sp_waiting) {
+        if (safety_manager->ok_to_spindle()) {
+            sp_waiting = false;
+            spindle_on(rpm);
+        } else if (!spindle_esc_booting()) {
+            sp_waiting    = false;
+            fb_sp_refused = true;
+        }
+    }
+}
+
 // Main loop housekeeping while the Pi has control
 void motion_periodic() {
     const uint32_t now = board_us();
@@ -860,6 +977,7 @@ void motion_periodic() {
     } else if (machine_alarmed()) {
         request_stop(REASON_ALARM);
     }
+    spindle_periodic();
 
     // Something reset the steppers (a g2core halt) and the segment chain stopped: hand back now
     if (us_since(last_exec_us, now) > (int32_t)EXEC_LOST_US) {
@@ -1087,7 +1205,17 @@ stat_t pi_link_exec_move() {
     if (owner == OWNER_PI) {
         // Two segments in a row, so a glitch on the input doesn't stop the job
         estop_segments = estop_input_active() ? (uint8_t)(estop_segments + 1) : 0;
-        uint8_t reason = (estop_segments >= ESTOP_SEGMENTS) ? (uint8_t)REASON_ESTOP : stop_request;
+        // The door opened while the host wants the spindle on: stop rather than feed a stopped
+        // cutter (the safety manager stops the spindle itself). With the spindle off an open door
+        // is allowed, as in stock firmware.
+        door_segments  = (sp_req_on && door_input_active()) ? (uint8_t)(door_segments + 1) : 0;
+        uint8_t reason = stop_request;
+        if (door_segments >= DOOR_SEGMENTS) {
+            reason = REASON_DOOR;
+        }
+        if (estop_segments >= ESTOP_SEGMENTS) {
+            reason = REASON_ESTOP;
+        }
         if ((reason == REASON_NONE) && (us_since(c.rx_us, t0) > (int32_t)link_cfg.watchdog_us)) {
             reason = REASON_WATCHDOG;
             diag.watchdog_trips++;

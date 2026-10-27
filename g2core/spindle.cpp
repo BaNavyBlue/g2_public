@@ -32,6 +32,9 @@
 
 #include "planner.h"            // for mp_queue_command()
 #include "spindle.h"
+#ifdef PI_LINK
+#include "pi_link.h"
+#endif
 
 ToolHead *active_toolhead = nullptr;
 bool spindle_pause_enabled = true;
@@ -138,6 +141,13 @@ bool is_spindle_on_or_paused() {
     return cm->gm.spindle_direction != SPINDLE_OFF;
 }
 bool is_a_toolhead_busy() {
+#ifdef PI_LINK
+    // The Pi waits for spindle speed itself (FEEDBACK reports it); holding the loader for a spin-up
+    // here would stall its segment chain.
+    if (pi_link_owns_machine()) {
+        return false;
+    }
+#endif
     // TODO: look at more than just one toolhead
     if (active_toolhead) {
         return active_toolhead->busy();
