@@ -7,9 +7,14 @@ Status:
   without moving X, Y or Z passes. Motor 4 had no motor attached then, so it carried the motion
   tests. Since 2026-10-22 the 4th axis is mounted: `bench-motor4.sh` won't take control unless
   `MOTOR4_FREE=1` says motor 4 is unplugged.
-- **Not done:** LinuxCNC driving X/Y/Z, homing on the real switches, probing, and the board
-  E-stop round trip through LinuxCNC. Spindle control isn't in the link yet, so the config
-  has no spindle.
+- **On the machine since:** X/Y/Z/A motion and Home All on the real switches (2026-10-21/22);
+  spindle M3/M5/S, M4 refused, door stop with the spindle on (2026-10-26); M3 with the door
+  open refused, and E-stop with the spindle on, with F1 recovery (2026-11-13).
+- **Door hold** (pause and resume, below): on the machine 2026-11-13, in a running program:
+  the door opening paused it with the spindle stopped (twice, no fault), Resume with the door
+  open stayed paused, nothing moved until Resume, then the spindle came back and the program
+  finished. Also passes `test/run.sh` and the firmware simulation. Not yet checked in MDI.
+- **Not done:** probing through LinuxCNC; a Z lift during the door hold.
 
 ## Files
 
@@ -17,8 +22,9 @@ Status:
 | --- | --- |
 | `pilink.c` | Realtime HAL component, plain C, built with `halcompile` |
 | `bantam-pilink.ini` | Machine config: 20 mm/s on X/Y, 10 mm/s on Z, 20 deg/s on A |
-| `bantam-pilink.hal` | Wiring: joints, home switches, probe, E-stop chain |
+| `bantam-pilink.hal` | Wiring: joints, home switches, probe, E-stop chain, spindle, door hold |
 | `tool.tbl` | One tool: the 1/4" probe |
+| `test/run.sh` | Host test of the door hold: `pilink.c` against stub HAL headers and a model of the board, over a pseudo-terminal |
 
 ## Install and start (on the Pi)
 
@@ -79,7 +85,9 @@ Driver states (`pilink.state`):
 `pilink.fault` (wired to every joint's `amp-fault-in`, so LinuxCNC turns the machine off) is
 set when:
 - the board refuses ENABLE (`pilink.result` = the board's result code; 100 = no reply);
-- the board takes control back: watchdog, E-stop, USB `!`, alarm (`pilink.release-reason`);
+- the board takes control back: watchdog, E-stop, USB `!`, alarm, or a door hold whose motion
+  wasn't at rest within `hold-ms` (`pilink.release-reason`);
+- the board refuses a spindle start (door open, E-stop or alarm), outside a door hold;
 - no FEEDBACK arrives for 20 ms while running (the driver then stops sending, so the board's
   watchdog stops the machine);
 - `position-cmd` is more than `enable-tolerance` from `position-fb` at machine on. LinuxCNC
@@ -94,6 +102,23 @@ The fault clears when the machine goes off.
 pulses `pilink.estop-reset`: if the board's E-stop is released but unacknowledged, the driver
 sends SAFETY acknowledge, then SAFETY clear (also sent for an alarm). `estop-ok` then goes
 true and LinuxCNC leaves E-stop.
+
+**Door hold:** opening the door with the spindle running pauses the job instead of ending it.
+1. The board stops the spindle and sets FEEDBACK's `hold_request` (`pilink.hold-request`).
+2. The driver raises `pilink.feed-inhibit` (`motion.feed-inhibit`: G-code motion decelerates
+   and stops; jogs are unaffected), pulses `pilink.pause` (`halui.program.pause`), and sends
+   the spindle request off. `pilink.door-hold` = 1.
+3. The board ends its hold once every motor has been commanded at rest for 10 ms. If that
+   hasn't happened within `hold-ms` (250), it stops the machine instead (release reason 4).
+4. Closing the door restarts nothing. Resume (`halui.program.is-paused` falling) with the door
+   closed sets `pilink.door-hold` = 2 and sends the spindle request on again. The board starts
+   the spindle once the ESC has rebooted (5 s after the door closes, if it was open for more
+   than 0.9 s). Resume with the door open pauses the program again.
+5. Once the spindle is at speed, `feed-inhibit` drops and the job goes on.
+
+Turning the spindle off (M5, abort, machine off) ends the hold with nothing to restart. Outside a
+running program (MDI, manual) there may be no pause to resume from; turning the spindle off and
+on again restarts it.
 
 **Board restart:** if FEEDBACK stops for over 500 ms and the board's clock then disagrees with
 the Pi's by over 200 ms (+0.2% drift), the board has rebooted and its counts restarted.
@@ -127,6 +152,11 @@ Global:
 | `pilink.estop-ok`, `.fault`, `.in-control`, `.link-ok`, `.position-lost` | bit out | above |
 | `pilink.input-01` .. `-16`, `.inputs` | out | g2core `in1`..`in16`: X home in1, E-stop in2, Y home in3, door in4, probe in5, Z home in6 |
 | `pilink.door-open`, `.esc-not-ready`, `.hold-request`, `.estop-pressed` | bit out | `safe` bits 0/1, FEEDBACK flag 0, `estp` bit 0 |
+| `pilink.spindle-on`, `.spindle-reverse`, `.spindle-speed-cmd` | in | `spindle.0.on`, `.reverse`, `.speed-out-abs` |
+| `pilink.spindle-at-speed`, `.spindle-waiting`, `.spindle-refused`, `.spindle-speed` | out | at speed (within 2%), start waiting for the ESC, start refused, the board's ramped rpm |
+| `pilink.feed-inhibit`, `.pause` | bit out | door hold: `motion.feed-inhibit`, `halui.program.pause` |
+| `pilink.program-paused` | bit in | `halui.program.is-paused` |
+| `pilink.door-hold` | s32 out | 0 none, 1 spindle stopped (waiting for Resume), 2 restarting |
 | `pilink.owner`, `.release-reason`, `.result`, `.board-state`, `.estp`, `.safe`, `.state` | s32 out | |
 | `pilink.feedback-age`, `.rx-frames`, `.rx-errors`, `.tx-errors`, `.stale-segments`, `.clamped`, `.late`, `.rx-gap-max` | out | diagnostics (`rx-gap-max` in µs, reset at ENABLE) |
 | `pilink.board-time`, `.reset-board-dt`, `.reset-pi-dt` | out | board clock, and what tripped `position-lost` |
@@ -156,9 +186,7 @@ didn't change in any run.
 
 ## Still to test (with someone at the machine)
 
-- Machine on, jogging X/Y/Z, and Home All on the real switches. The config assumes in1, in3
-  and in6 read 1 while pressed (they read 0 off the switches).
-- Board E-stop while running: LinuxCNC E-stop, then F1 acknowledges and clears it.
+- Door hold in MDI (`M3`, then open the door), where halui's pause may not apply.
 - Probing on in5.
 - Following error and `p-gain` at higher speeds.
 - One false `position-lost` was seen in an early build, before the 500 ms gap rule. It didn't

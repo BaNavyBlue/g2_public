@@ -24,6 +24,7 @@ setp pilink.segment-us  [PILINK]SEGMENT_US
 setp pilink.watchdog-ms [PILINK]WATCHDOG_MS
 setp pilink.p-gain      [PILINK]P_GAIN
 setp pilink.latency     [PILINK]LATENCY
+setp pilink.hold-ms     [PILINK]HOLD_MS
 
 # Machine on <-> the Pi has control. A refused ENABLE or a board stop shows up as an amp fault.
 net machine-on   motion.motion-enabled => pilink.enable
@@ -77,6 +78,14 @@ net spindle-on     spindle.0.on            => pilink.spindle-on
 net spindle-rev    spindle.0.reverse       => pilink.spindle-reverse
 net spindle-rpm    spindle.0.speed-out-abs => pilink.spindle-speed-cmd
 net spindle-ready  pilink.spindle-at-speed => spindle.0.at-speed
+
+# Door hold: the door opening with the spindle running stops the spindle, holds G-code motion
+# and pauses the program (jogs still work). Close the door and Resume: the spindle restarts and
+# motion goes on once it's at speed. If motion isn't at rest within [PILINK]HOLD_MS the board
+# stops the machine. halui (INI [HAL]HALUI) is loaded before this file, so its pins exist here.
+net door-inhibit   pilink.feed-inhibit     => motion.feed-inhibit
+net door-pause     pilink.pause            => halui.program.pause
+net prog-paused    halui.program.is-paused => pilink.program-paused
 
 # E-stop: LinuxCNC's chain AND the board (link up, E-stop clear and acknowledged, no alarm).
 # An E-stop reset (F1) also acknowledges and clears the board's E-stop over the link.

@@ -53,7 +53,10 @@ enum { RESULT_OK = 0, RESULT_TIMEOUT = 100 };   /* 1-6 come from the board */
 enum { KIND_NONE = 0, KIND_MOTION, KIND_OTHER };
 enum { ST_IDLE = 0, ST_ENABLING, ST_RUNNING, ST_DISABLING, ST_WAIT_USB };
 
+enum { HOLD_NONE = 0, HOLD_STOPPED, HOLD_RESTART };
+
 #define POLL_PERIODS        10      /* zero MOTION every 10 ms while not in control */
+#define PAUSE_PULSE         100     /* periods pilink.pause stays up: halui acts on its rising edge */
 #define REPLY_TIMEOUT       50      /* periods to wait for an ENABLE/DISABLE/SAFETY reply */
 #define LINK_LOST_PERIODS   50      /* no FEEDBACK for this long: link down */
 #define RUN_LOST_PERIODS    20      /* ...while running: stop sending, let the watchdog stop it */
@@ -116,6 +119,10 @@ typedef struct {
     hal_bit_t   *spindle_at_speed;  /* out: on, and the board's ramped speed within 2% of the command */
     hal_bit_t   *spindle_waiting;   /* out: the start waits for the ESC to finish booting */
     hal_bit_t   *spindle_refused;   /* out: the board refused the start; holds until spindle-on drops */
+    hal_bit_t   *program_paused;    /* in: halui.program.is-paused */
+    hal_bit_t   *feed_inhibit;      /* out: motion.feed-inhibit, held through a door hold */
+    hal_bit_t   *pause;             /* out: halui.program.pause, pulsed when a door hold starts */
+    hal_s32_t   *door_hold;         /* out: 0 none, 1 spindle stopped (waiting for Resume), 2 restarting */
     hal_u32_t   *feedback_age;      /* out: periods since the last FEEDBACK */
     hal_u32_t   *rx_frames;         /* out */
     hal_u32_t   *rx_errors;         /* out: bad COBS, CRC, length or version */
@@ -160,6 +167,9 @@ typedef struct {
     int      stop_wait;
     int      prev_enable;
     int      prev_reset;
+    int      hold;                  /* HOLD_* */
+    int      pause_left;            /* periods of pilink.pause still to send */
+    int      prev_paused;
     double   period_s;
 
     uint8_t  rx[2048];
@@ -449,8 +459,9 @@ static void pilink_read(void *arg, long period) {
 }
 
 static const char *reason_name(int r) {
-    static const char *names[] = {"none", "DISABLE", "watchdog", "E-stop", "door opened with the spindle on",
-                                  "alarm", "bad frame", "USB stop", "segment chain lost"};
+    static const char *names[] = {"none", "DISABLE", "watchdog", "E-stop",
+                                  "door opened with the spindle on and motion didn't stop in time", "alarm",
+                                  "bad frame", "USB stop", "segment chain lost"};
     return ((r >= 0) && (r < (int)(sizeof(names) / sizeof(names[0])))) ? names[r] : "unknown";
 }
 
@@ -515,6 +526,55 @@ static double reference(const motor_t *m, uint16_t seq, double latency) {
     return a - f * (a - b);
 }
 
+static void hold_stop(pilink_t *d) {
+    if (d->hold != HOLD_STOPPED) {
+        rtapi_print_msg(RTAPI_MSG_ERR, "pilink: door opened with the spindle on: paused and the spindle stopped. "
+                        "Close the door, then Resume (or turn the spindle off)\n");
+    }
+    d->hold               = HOLD_STOPPED;
+    d->pause_left         = PAUSE_PULSE;
+    *d->spindle_refused   = 0;
+}
+
+/* Door hold (PROTOCOL-v1-draft.md, "Door interlock"). When the door opens with the spindle
+ * running, the board stops the spindle and expects motion at rest within hold-ms. Here: hold
+ * G-code motion (feed-inhibit), pause the program, and keep the spindle request off until the
+ * door is closed and the program resumed; then restart the spindle and let motion go once it's
+ * at speed. Closing the door alone restarts nothing. Returns the spindle request to send. */
+static int door_hold(pilink_t *d, int sp_on) {
+    const int paused  = *d->program_paused;
+    const int resumed = d->prev_paused && !paused;
+    d->prev_paused    = paused;
+
+    if (!sp_on) {
+        d->hold = HOLD_NONE;        /* M5, abort or machine off: nothing to restart */
+    } else if (*d->hold_request || (*d->door_open && (d->fb_sp_dir != 0))) {
+        hold_stop(d);
+    } else if (d->hold == HOLD_STOPPED) {
+        if (resumed && *d->door_open) {
+            d->pause_left = PAUSE_PULSE;    /* resumed with the door still open: pause again */
+        } else if (resumed) {
+            d->hold = HOLD_RESTART;
+        }
+    } else if (d->hold == HOLD_RESTART) {
+        if (*d->door_open || *d->spindle_refused) {
+            hold_stop(d);           /* opened again before the spindle was back */
+        } else if (*d->spindle_at_speed) {
+            d->hold = HOLD_NONE;
+            rtapi_print_msg(RTAPI_MSG_ERR, "pilink: spindle back at speed: resuming\n");
+        }
+    }
+
+    if (d->pause_left > 0) {
+        d->pause_left--;
+    }
+    *d->pause        = d->pause_left > 0;
+    /* hold-request too: the board's hold runs to rest even if the spindle was just turned off */
+    *d->feed_inhibit = (d->hold != HOLD_NONE) || *d->hold_request;
+    *d->door_hold    = d->hold;
+    return sp_on && (d->hold != HOLD_STOPPED);
+}
+
 static void run_motion(pilink_t *d) {
     const double T = d->period_s;
     float v[MOTORS];
@@ -556,8 +616,10 @@ static void run_motion(pilink_t *d) {
         set_fault(d, 0, "M4: the spindle can't run in reverse");
         sp_on = 0;
     }
+    sp_on = door_hold(d, sp_on);
     if (sp_on && *d->spindle_refused) {
         set_fault(d, 0, "the board refused the spindle start: door open, E-stop or alarm");
+        sp_on = 0;
     }
     send_motion(d, v, sp_on, sp_on ? (float)*d->spindle_speed_cmd : 0.0f, KIND_MOTION);
 }
@@ -567,6 +629,11 @@ static void zero_outputs(pilink_t *d) {
         *d->m[i].velocity_cmd = 0;
         d->m[i].v_prev        = 0;
     }
+    d->hold          = HOLD_NONE;   /* out of control: a board stop has ended any hold */
+    d->pause_left    = 0;
+    *d->pause        = 0;
+    *d->feed_inhibit = 0;
+    *d->door_hold    = HOLD_NONE;
 }
 
 static void pilink_write(void *arg, long period) {
@@ -818,6 +885,10 @@ int rtapi_app_main(void) {
     PIN(hal_pin_bit_newf  (HAL_OUT, &d->spindle_at_speed,  comp_id, "pilink.spindle-at-speed"));
     PIN(hal_pin_bit_newf  (HAL_OUT, &d->spindle_waiting,   comp_id, "pilink.spindle-waiting"));
     PIN(hal_pin_bit_newf  (HAL_OUT, &d->spindle_refused,   comp_id, "pilink.spindle-refused"));
+    PIN(hal_pin_bit_newf  (HAL_IN,  &d->program_paused,    comp_id, "pilink.program-paused"));
+    PIN(hal_pin_bit_newf  (HAL_OUT, &d->feed_inhibit,      comp_id, "pilink.feed-inhibit"));
+    PIN(hal_pin_bit_newf  (HAL_OUT, &d->pause,             comp_id, "pilink.pause"));
+    PIN(hal_pin_s32_newf  (HAL_OUT, &d->door_hold,         comp_id, "pilink.door-hold"));
     PIN(hal_pin_u32_newf  (HAL_OUT, &d->feedback_age,   comp_id, "pilink.feedback-age"));
     PIN(hal_pin_u32_newf  (HAL_OUT, &d->rx_frames,      comp_id, "pilink.rx-frames"));
     PIN(hal_pin_u32_newf  (HAL_OUT, &d->rx_errors,      comp_id, "pilink.rx-errors"));
