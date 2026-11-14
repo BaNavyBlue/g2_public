@@ -13,7 +13,9 @@ Status:
 - **Door hold** (pause and resume, below): on the machine 2026-11-13, in a running program:
   the door opening paused it with the spindle stopped (twice, no fault), Resume with the door
   open stayed paused, nothing moved until Resume, then the spindle came back and the program
-  finished. Also passes `test/run.sh` and the firmware simulation. Not yet checked in MDI.
+  finished. In MDI (`M3`, then the door): the spindle stopped with no fault or error, Resume
+  did nothing (no program to resume), and turning the spindle off and on restarted it. Also
+  passes `test/run.sh` and the firmware simulation.
 - **Not done:** probing through LinuxCNC; a Z lift during the door hold.
 
 ## Files
@@ -186,7 +188,6 @@ didn't change in any run.
 
 ## Still to test (with someone at the machine)
 
-- Door hold in MDI (`M3`, then open the door), where halui's pause may not apply.
 - Probing on in5.
 - Following error and `p-gain` at higher speeds.
 - One false `position-lost` was seen in an early build, before the 500 ms gap rule. It didn't
