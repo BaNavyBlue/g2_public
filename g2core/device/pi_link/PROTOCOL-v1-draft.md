@@ -35,6 +35,10 @@ Status:
 - **Door hold (phase B, below):** on the machine since 2026-11-13, in a running program:
   paused and resumed twice with no board stop; Resume with the door open stays paused. Also
   covered by the host simulation and `linuxcnc/test/run.sh`. Not done: the Z lift.
+- **Idle current while the Pi has control** (2026-11-13): once no motor has moved for `$mt`
+  (2 s), motors in the reduced-when-idle power mode drop to idle current, as in stock firmware;
+  the first moving segment restores full current on all of them. None is ever turned off. On the
+  machine: audibly quieter at rest.
 
 v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
 version stays 0 until v1 ships.

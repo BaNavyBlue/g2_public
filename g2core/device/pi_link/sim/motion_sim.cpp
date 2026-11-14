@@ -271,6 +271,7 @@ int main() {
     if (m != (void *)0x400A0000UL) { perror("mmap"); return 2; }
     for (int i = 0; i < 16; i++) in_r[i] = &readers[i];
     for (int k = 0; k < 4; k++) st_cfg.mot[k].steps_per_unit = steps_per_unit[k];
+    st_cfg.motor_power_timeout = 2.0f;      // $mt, as on the Desktop CNC
     cm1.machine_state = MACHINE_READY;
     pi_link_init();
     run_for(0.01, [](double, float *) { return false; });
@@ -563,6 +564,30 @@ int main() {
     { const float z[4] = {0, 0, 0, 0}; host_motion(z, 2, 10000); }
     run_for(0.1, zero);
     check(last_fb.owner == 0 && last_fb.reason == 6 && sp_dir == SPINDLE_OFF, "control back with USB, reason bad frame, spindle off");
+
+    // 18. Idle current at rest: the whole machine at rest for $mt; any motion restores every motor
+    puts("18. idle current after $mt (2 s) at rest, full current again before the first step");
+    host_enable();
+    run_for(1.9, zero);
+    check(!motor_objs[0].idle && !motor_objs[3].idle, "full current until 2 s at rest");
+    run_for(0.2, zero);
+    check(motor_objs[0].idle && motor_objs[1].idle && motor_objs[2].idle && motor_objs[3].idle, "all four at idle current after 2 s");
+    bool moved_while_idle = false;
+    on_prep = [&](const float *from, const float *to) {
+        bool moving = false;
+        for (int k = 0; k < 4; k++) moving = moving || (fabsf(from[k]) > 0) || (fabsf(to[k]) > 0);
+        for (int k = 0; k < 4; k++) moved_while_idle = moved_while_idle || (moving && motor_objs[k].idle);
+    };
+    run_for(2.5, cruise_x);
+    on_prep = nullptr;
+    check(!moved_while_idle, "every motor at full current from the first moving segment on");
+    check(!motor_objs[1].idle, "Y, holding still for 2.5 s while X moves, keeps full current");
+    run_for(1.9, zero);
+    check(!motor_objs[0].idle, "full current for 2 s after the motion ends");
+    run_for(0.2, zero);
+    check(motor_objs[0].idle && motor_objs[1].idle, "then idle again");
+    host_send(0x12, {});
+    run_for(0.2, zero);
 
     printf("\nrx bytes lost %u, bad reply frames %d, feedbacks %d, exec max %u us (host clock, not meaningful)\n",
            lost_rx, bad_tx_frames, feedbacks, diag.exec_max_us);

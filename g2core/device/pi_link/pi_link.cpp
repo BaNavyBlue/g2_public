@@ -460,6 +460,8 @@ volatile bool     hold_active    = false;   // door hold: the host must bring th
 uint32_t          hold_start_us  = 0;
 float             hold_still_s   = 0;   // how long every motor has been commanded at rest during the hold
 volatile bool     hold_stop_spindle = false;    // exec interrupt -> main loop: a hold began, stop the spindle
+volatile uint32_t last_moving_us = 0;   // board time of the newest segment with any motor moving
+volatile bool     motors_idle    = false;   // main loop dropped the motors to idle current; motion restores them
 
 // Spindle. The link interrupt records each MOTION's request; the main loop acts on changes to
 // it (spindle_periodic), since the ESC code runs from there.
@@ -811,8 +813,10 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
     last_exec_us         = now;
     last_sync_us         = now;
 
+    last_moving_us = now;
+    motors_idle    = false;
     for (uint8_t m = 0; m < MOTORS; m++) {
-        Motors[m]->enable();    // energized for as long as the Pi has control
+        Motors[m]->enable();    // energized for as long as the Pi has control (idle current at rest)
     }
     __asm__ volatile("dmb" ::: "memory");
     owner = OWNER_PI;
@@ -1008,6 +1012,21 @@ void motion_periodic() {
         request_stop(REASON_ALARM);
     }
     spindle_periodic();
+
+    // Quiet at rest, as in stock firmware: once no motor has moved for the motor timeout ($mt),
+    // motors in the reduced-when-idle power mode drop to idle current, until the next motion
+    // (exec interrupt). None is turned off: the Pi holds position and wouldn't learn it was lost.
+    if ((owner == OWNER_PI) && !motors_idle) {
+        const uint32_t primask = __get_PRIMASK();
+        __disable_irq();        // so a segment can't start moving between the check and the drop
+        if ((float)us_since(last_moving_us, board_us()) > st_cfg.motor_power_timeout * 1.0e6f) {
+            for (uint8_t m = 0; m < PI_MOTORS; m++) {
+                Motors[m]->idleNow();
+            }
+            motors_idle = true;
+        }
+        __set_PRIMASK(primask);
+    }
 
     // Something reset the steppers (a g2core halt) and the segment chain stopped: hand back now
     if (us_since(last_exec_us, now) > (int32_t)EXEC_LOST_US) {
@@ -1314,6 +1333,17 @@ stat_t pi_link_exec_move() {
             moving = true;
         }
         v_prev[m] = vv;
+    }
+    if (moving) {
+        last_moving_us = t0;
+        if (motors_idle) {
+            // Full current on every motor, a segment before the first step: a motor holding still
+            // while another one cuts keeps its full holding torque, as before the rest
+            motors_idle = false;
+            for (uint8_t m = 0; m < PI_MOTORS; m++) {
+                Motors[m]->enable();
+            }
+        }
     }
     st_prep_velocity_segment(from, to, link_cfg.seg_ticks);
     diag.segments++;

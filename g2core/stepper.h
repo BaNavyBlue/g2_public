@@ -497,6 +497,11 @@ public:
 
     virtual void periodicCheck(bool have_actually_stopped) {}; // can be overridden
     virtual void setActivityTimeout(float idle_milliseconds) {}; // can be overridden
+#ifdef PI_LINK
+    // The Pi link, once the whole machine has rested for the motor timeout: drop to idle current
+    // now if the power mode reduces at idle. The next enable() restores full current.
+    virtual void idleNow() {};
+#endif
 
     /* Functions that must be implemented in subclasses */
 

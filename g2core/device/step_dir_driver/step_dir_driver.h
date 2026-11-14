@@ -304,6 +304,18 @@ struct StepDirStepper final : Stepper  {
         _motor_activity_timeout_ms = idle_milliseconds;
     };
 
+#ifdef PI_LINK
+    // While the Pi has control the loader runs a segment every period, so motionStopped() restarts
+    // the timeout each time and periodicCheck() would never reach idle: the link calls this instead
+    void idleNow() override
+    {
+        if ((_power_mode == MOTOR_POWER_REDUCED_WHEN_IDLE) && (_power_state != MOTOR_IDLE)) {
+            _power_state = MOTOR_IDLE;
+            _updatePowerLevel();
+        }
+    };
+#endif
+
 
     void periodicCheck(bool have_actually_stopped) override
     {

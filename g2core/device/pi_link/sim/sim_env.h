@@ -45,7 +45,11 @@ inline bool mp_runtime_is_idle() { return true; }
 void mp_set_runtime_position(uint8_t axis, const float position);
 
 // stepper
-struct Stepper { void enable() {} };
+struct Stepper {     // records power state: idle current or full
+    bool idle = false;
+    void enable() { idle = false; }
+    void idleNow() { idle = true; }
+};
 extern Stepper *Motors[MOTORS];
 stat_t st_prep_velocity_segment(const float v0[], const float v1[], const uint16_t ticks);
 void st_request_exec_move();
@@ -134,7 +138,7 @@ enum { BLOCK_TYPE_NULL = 0, BLOCK_TYPE_ALINE = 1 };
 struct stPrepMotor_t { int64_t substep_increment; int64_t substep_increment_increment; uint8_t direction; int8_t step_sign; };
 struct stPrep_t { volatile int buffer_state; int block_type; void *bf; int32_t dda_ticks; stPrepMotor_t mot[MOTORS]; };
 struct stCfgMotor_t { uint8_t polarity; float steps_per_unit; };
-struct stConfig_t { stCfgMotor_t mot[MOTORS]; };
+struct stConfig_t { stCfgMotor_t mot[MOTORS]; float motor_power_timeout; };
 extern stPrep_t st_pre;
 extern stConfig_t st_cfg;
 
