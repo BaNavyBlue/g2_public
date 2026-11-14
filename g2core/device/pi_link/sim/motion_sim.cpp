@@ -438,37 +438,115 @@ int main() {
     run_for(0.05, zero);
     check(sp_dir == SPINDLE_CW, "starts once the ESC is ready");
 
-    // 11. Door opens with the spindle on, main loop stalled
-    puts("11. door opened with the spindle on and the main loop stalled");
+    // 11. Door opens with the spindle on and the host never stops: the hold times out, main loop or not
+    puts("11. door opened with the spindle on, the host keeps moving, main loop stalled");
     run_for(0.2, cruise_x);
     main_stalled = true;
     segs         = 0;
     stop_seg     = -1;
-    on_prep = [&](const float *, const float *) { segs++; if ((stop_seg < 0) && (owner == OWNER_STOPPING)) stop_seg = segs; };
+    int hold_seg = -1;
+    on_prep = [&](const float *, const float *) {
+        segs++;
+        if ((hold_seg < 0) && hold_active) hold_seg = segs;
+        if ((stop_seg < 0) && (owner == OWNER_STOPPING)) stop_seg = segs;
+    };
     sim_door          = true;
     sim_bsm.door_open = true;
-    run_for(0.1, cruise_x);
+    run_for(0.4, cruise_x);
     on_prep = nullptr;
-    printf("  board stop began at segment %d after the door opened\n", stop_seg);
-    check((stop_seg > 0) && (stop_seg <= DOOR_SEGMENTS), "the board stop starts within 2 segments, main loop or not");
+    const double seg_ms = 31 / 61.0;
+    printf("  hold began at segment %d, board stop at segment %d (%.0f ms after the door opened)\n", hold_seg, stop_seg,
+           stop_seg * seg_ms);
+    check((hold_seg > 0) && (hold_seg <= DOOR_SEGMENTS), "the hold starts within 2 segments, main loop or not");
+    check((stop_seg > 0) && fabs((stop_seg - hold_seg) * seg_ms - 250) < 2, "the board stops once hold_timeout_ms (250) runs out");
     main_stalled = false;
     run_for(0.05, zero);
     { const float z[4] = {0, 0, 0, 0}; host_motion(z); }
     run_for(0.01, zero);
     check(last_fb.owner == 0 && last_fb.reason == 4, "control back with USB, reason door");
     check(sp_dir == SPINDLE_OFF, "spindle off after the stop");
-    sim_sp_on = 0;
+    sim_door          = false;
+    sim_bsm.door_open = false;
+    sim_sp_on         = 0;
 
-    // 12. Door open with the spindle off: allowed
-    puts("12. an open door with the spindle off doesn't stop motion");
+    // 12. Door hold the host honours: it decelerates in time, Pi keeps control, and the job can resume
+    puts("12. door hold: the host stops in time, then restarts the spindle after the door closes");
     host_enable();
+    sim_sp_on  = 1;
+    sim_sp_rpm = 12000;
+    run_for(0.2, cruise_x);
+    check(sp_dir == SPINDLE_CW, "spindle on, moving");
+    const double t_open = now_us() / 1e6;
+    fb_flags_seen       = 0;
+    sim_door            = true;
+    sim_bsm.door_open   = true;
+    run_for(0.3, [&](double t, float *v) {      // 3 ms to react, then 80 ms down to rest
+        const double dt = t - t_open - 0.003;
+        v[0] = (float)((dt < 0) ? 8000 : fmax(0.0, 8000 - 100000 * dt));
+        v[1] = v[2] = v[3] = 0;
+        return true;
+    });
+    check((fb_flags_seen & 0x01) && !(last_fb.flags & 0x01), "FEEDBACK asked for the hold, and stopped asking once at rest");
+    check(owner == OWNER_PI && sp_dir == SPINDLE_OFF, "Pi still in control, spindle stopped");
+    run_for(0.3, [](double, float *v) { v[0] = 0; v[1] = 0; v[2] = 2000; v[3] = 0; return true; });
+    check(owner == OWNER_PI, "after the hold, motion with the door open is allowed (a Z lift)");
+    sim_door          = false;
+    sim_bsm.door_open = false;
+    run_for(0.1, zero);
+    check(sp_dir == SPINDLE_OFF, "closing the door doesn't restart the spindle (request still on)");
+    sim_sp_on = 0;
+    run_for(0.02, zero);
+    sim_sp_on = 1;
+    run_for(0.05, zero);
+    check(sp_dir == SPINDLE_CW, "the host's off-then-on restarts it");
+    fb_flags_seen     = 0;
+    sim_door          = true;
+    sim_bsm.door_open = true;
+    run_for(0.1, zero);
+    check((fb_flags_seen & 0x01) && owner == OWNER_PI && sp_dir == SPINDLE_OFF, "a second opening holds again");
+    sim_door          = false;
+    sim_bsm.door_open = false;
+    sim_sp_on         = 0;
+    run_for(0.02, zero);
+
+    // 13. A start refused with the door open doesn't hold or stop the board
+    puts("13. spindle start with the door open: refused, and motion carries on");
+    sim_door          = true;
+    sim_bsm.door_open = true;
+    fb_flags_seen     = 0;
+    sim_sp_on         = 1;
+    run_for(0.4, cruise_x);
+    check((fb_flags_seen & 0x10) && !(fb_flags_seen & 0x01), "refused, and no hold asked for");
+    check(owner == OWNER_PI && sp_dir == SPINDLE_OFF, "Pi still in control while the request stays on, spindle off");
+    sim_door          = false;
+    sim_bsm.door_open = false;
+    sim_sp_on         = 0;
+    run_for(0.02, zero);
+
+    // 14. A door glitch shorter than a segment doesn't hold
+    puts("14. a 300 us door glitch with the spindle on");
+    sim_sp_on = 1;
+    run_for(0.05, zero);
+    fb_flags_seen = 0;
+    sim_door      = true;
+    run_for(0.0003, cruise_x);
+    sim_door = false;
+    run_for(0.05, cruise_x);
+    check(!(fb_flags_seen & 0x01) && sp_dir == SPINDLE_CW, "no hold, spindle still on");
+    sim_sp_on = 0;
+    run_for(0.02, zero);
+
+    // 15. Door open with the spindle off: allowed
+    puts("15. an open door with the spindle off doesn't stop motion");
+    sim_door          = true;
+    sim_bsm.door_open = true;
     run_for(0.2, cruise_x);
     check(owner == OWNER_PI, "still moving with the door open");
     sim_door          = false;
     sim_bsm.door_open = false;
 
-    // 13. DISABLE with the spindle on
-    puts("13. DISABLE hands back with the spindle off");
+    // 16. DISABLE with the spindle on
+    puts("16. DISABLE hands back with the spindle off");
     sim_sp_on  = 1;
     sim_sp_rpm = 12000;
     run_for(0.05, zero);
@@ -478,8 +556,8 @@ int main() {
     check(last_fb.owner == 0 && sp_dir == SPINDLE_OFF, "back with USB, spindle off");
     sim_sp_on = 0;
 
-    // 14. Reverse is refused
-    puts("14. a reverse (CCW) request is a bad frame");
+    // 17. Reverse is refused
+    puts("17. a reverse (CCW) request is a bad frame");
     host_enable();
     run_for(0.02, zero);
     { const float z[4] = {0, 0, 0, 0}; host_motion(z, 2, 10000); }

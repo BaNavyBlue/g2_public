@@ -29,9 +29,12 @@ Status:
     is 61,046.5 Hz if the period is RC counts and 60,957.9 Hz if it is RC + 1, and neither
     fits. Measure the DDA rate against the board clock before correcting anything; the
     host's position loop absorbs it either way.
-- **Spindle control (phase A):** in the firmware and the host simulation, not yet run on the
-  machine. An open door with the spindle wanted stops the board (reason 4).
-- **Not done:** the resumable door hold (phase B, below).
+- **Spindle control (phase A):** on the machine since 2026-10-26 (101.17-26-g3799): M3/M5/S,
+  M4 refused, the door with the spindle on stops the board; M3 with the door open refused and
+  E-stop with the spindle on (2026-11-13).
+- **Door hold (phase B, below):** on the machine since 2026-11-13, in a running program:
+  paused and resumed twice with no board stop; Resume with the door open stays paused. Also
+  covered by the host simulation and `linuxcnc/test/run.sh`. Not done: the Z lift.
 
 v0 (PROTOCOL.md: framing, PING, STATUS) stays as it is; v1 adds frame types. The frame
 version stays 0 until v1 ships.
@@ -136,7 +139,7 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 | DISABLE from the host | 1 |
 | Watchdog: no valid MOTION for `watchdog_ms` | 2 |
 | E-stop pressed (g2core also shuts down: spindle off, axes unhomed). The exec interrupt reads the input itself and stops after 2 segments in a row, so a stalled main loop can't delay it. | 3 |
-| Door opened while the host wants the spindle on. The exec interrupt reads the door switch and stops after 2 segments in a row (phase A; phase B turns this into a hold, below). | 4 |
+| Door hold not honoured: the door opened with the spindle started and the motors weren't at rest within `hold_timeout_ms` (below). | 4 |
 | g2core alarm, shutdown or panic | 5 |
 | Bad MOTION frame (wrong length, NaN or infinite velocity, spindle request in a build without spindle control) | 6 |
 | USB `!`, `%` or ^D | 7 |
@@ -144,38 +147,36 @@ The board's own stop, used whenever it ends Pi control while the motors may be m
 
 ## Door interlock while the Pi has control
 
-**Phase A (built):** the door switch is read by the exec interrupt, like the E-stop.
+The door switch is read by the exec interrupt, like the E-stop. Phase A (2026-10-26) stopped
+the board (reason 4) whenever the door opened with the spindle wanted, ending the job; phase B
+(built, below) replaces that with a resumable hold.
 
-- **Spindle off:** reported only (`safe` bit 0), as in stock firmware. Motion with the door
-  open is allowed.
-- **Spindle wanted** (the host's newest MOTION asks for it): the board stops (reason 4) once
-  the door has read open for 2 segments, whatever the main loop is doing. The safety manager
-  stops the spindle at once and cuts the ESC's power 0.9 s later, as in stock firmware. The job
-  ends.
-
-**Phase B (planned):** the resumable hold the user asked for, replacing the stop above:
-
-- **Spindle off:** reported only (`safe` bit 0), as in stock firmware.
-- **Spindle on:**
-  - The board stops the spindle at once (the ESC loses power shortly after anyway) and sets
-    `hold_request` in FEEDBACK.
-  - The host should pause (LinuxCNC feed hold), so the machine decelerates along its path
-    and can resume.
-  - If the motors have not all reached zero velocity within `hold_timeout_ms` of the door
-    opening, the board stops on its own (reason 4).
-  - Once they have, the hold is satisfied and `hold_request` clears. Motion with the door
-    open is then allowed again, as in stock firmware with the spindle off. That allows a Z
-    lift off the work.
-  - The spindle can't restart until the door is closed and the ESC has rebooted (5 s), as
-    in stock firmware.
+- **Spindle off, or a start that was refused:** reported only (`safe` bit 0), as in stock
+  firmware. Motion with the door open is allowed. (Phase A also stopped the board right after
+  refusing a start with the door open, since the request was still on.)
+- **Spindle started** (a start the safety manager allowed, for the current request): once the
+  door has read open for 2 segments, whatever the main loop is doing, the board holds:
+  - It stops the spindle (the safety manager does too, and cuts the ESC's power 0.9 s later,
+    as in stock firmware) and sets `hold_request` in FEEDBACK.
+  - The host should pause (LinuxCNC: `motion.feed-inhibit`), so the machine decelerates along
+    its path and can resume.
+  - The hold is satisfied once every motor's commanded velocity has been below 100 steps/s
+    for 10 ms; `hold_request` clears. Motion with the door open is then allowed again, as
+    with the spindle off. That allows a Z lift off the work.
+  - If it isn't satisfied within `hold_timeout_ms` of the door opening, the board stops on its
+    own (reason 4). Dropping the spindle request doesn't end a hold early.
+  - The spindle stays off until the host sends off and then on again, and can't start until
+    the door is closed and the ESC has rebooted (5 s), as in stock firmware.
 - **Lift and resume rules belong to the LinuxCNC config, not the board.** The config must
-  include all of these:
-  - **Resume only when all three hold:** door closed, ESC ready, and spindle at speed (from
-    FEEDBACK `safe` and the actual spindle speed). Until then, `motion.feed-inhibit` is held
-    true.
+  include all of these (`linuxcnc/HAL-DRIVER.md`, "Door hold", does the first two):
+  - **Resume only on the operator's Resume**, with the door closed. Closing the door alone
+    restarts nothing.
+  - **Release motion only when all three hold:** door closed, ESC ready, and spindle at speed
+    (from FEEDBACK `safe` and the actual spindle speed). Until then, `motion.feed-inhibit` is
+    held true.
     - LinuxCNC's own wait for spindle-at-speed only covers the first feed move after a speed
       change, so it doesn't reliably cover a resume.
-  - **Lift:** after the hold, raise Z by a few mm with an external offset on Z (or QtDragon's
+  - **Lift (not done yet):** after the hold, raise Z by a few mm with an external offset on Z (or QtDragon's
     built-in spindle-lift pause). Returning to the paused point removes the offset.
   - Stock g2core can do the same on the USB path: `zl` (lift on feedhold) followed by the
     spindle spin-up delay on resume. The Desktop CNC settings ship `zl` = 0, i.e. no lift;

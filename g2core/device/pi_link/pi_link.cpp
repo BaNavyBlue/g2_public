@@ -373,7 +373,9 @@ constexpr uint32_t STALE_US          = 2000;    // a segment is stale if the new
 constexpr uint32_t EXEC_LOST_US      = 20000;   // no segment prepared for this long while in control: chain lost
 constexpr uint32_t SYNC_PERIOD_US    = 10000;   // how often USB-visible positions follow the step counters
 constexpr uint8_t  ESTOP_SEGMENTS    = 2;       // E-stop input seen active this many segments in a row stops the Pi
-constexpr uint8_t  DOOR_SEGMENTS     = 2;       // door seen open this many segments in a row, spindle wanted: stop
+constexpr uint8_t  DOOR_SEGMENTS     = 2;       // door seen open this many segments in a row, spindle started: hold
+constexpr float    HOLD_STILL_RATE   = 100.0f;  // steps/s: every motor commanded below this counts as at rest
+constexpr float    HOLD_STILL_S      = 0.010f;  // ...for this long in a row ends a door hold
 constexpr uint8_t  SPINDLE_REQUEST_MAX = PI_LINK_MOTION ? 1 : 0;   // 1 = on (CW); the ESC can't reverse
 
 enum : uint8_t {
@@ -453,7 +455,11 @@ float   ref_travel[PI_MOTORS];
 // exec interrupt state
 float             v_prev[PI_MOTORS];    // end velocity of the last segment prepared, steps/s
 uint8_t           estop_segments = 0;   // segments in a row the E-stop input has read active
-uint8_t           door_segments  = 0;   // segments in a row the door has read open while the spindle is wanted
+uint8_t           door_segments  = 0;   // segments in a row the door has read open while the spindle is started
+volatile bool     hold_active    = false;   // door hold: the host must bring the motors to rest in time
+uint32_t          hold_start_us  = 0;
+float             hold_still_s   = 0;   // how long every motor has been commanded at rest during the hold
+volatile bool     hold_stop_spindle = false;    // exec interrupt -> main loop: a hold began, stop the spindle
 
 // Spindle. The link interrupt records each MOTION's request; the main loop acts on changes to
 // it (spindle_periodic), since the ESC code runs from there.
@@ -462,6 +468,7 @@ volatile float   sp_req_rpm    = 0;
 uint8_t          sp_seen_on    = 0;     // the request the main loop last acted on
 float            sp_seen_rpm   = 0;
 bool             sp_running    = false; // the link has the spindle on
+volatile bool    sp_armed      = false; // started for the current request, and no door hold since: the door check applies
 volatile bool    sp_waiting    = false; // a start is waiting for the ESC to finish booting
 volatile bool    fb_sp_refused = false; // set by the main loop, cleared by the next FEEDBACK
 float             stop_v0[PI_MOTORS];
@@ -565,6 +572,7 @@ void begin_stop(uint8_t reason) {
     owner          = OWNER_STOPPING;
     release_reason = reason;
     stop_request   = REASON_NONE;
+    hold_active    = false;     // the board stop replaces any door hold
     stop_t         = 0;
     stop_len       = 0;
     for (uint8_t m = 0; m < PI_MOTORS; m++) {
@@ -647,8 +655,9 @@ void send_feedback(uint16_t seq, uint8_t result) {
     p[0] = result;
     p[1] = owner;
     p[2] = release_reason;
-    p[3] = (fb_clamped ? FB_CLAMPED : 0) | (stale ? FB_STALE : 0) | (PI_LINK_MOTION ? 0 : FB_MOTION_LOCKED) |
-           (refused ? FB_SPINDLE_REFUSED : 0) | (sp_waiting ? FB_SPINDLE_WAITING : 0);
+    p[3] = (hold_active ? FB_HOLD_REQUEST : 0) | (fb_clamped ? FB_CLAMPED : 0) | (stale ? FB_STALE : 0) |
+           (PI_LINK_MOTION ? 0 : FB_MOTION_LOCKED) | (refused ? FB_SPINDLE_REFUSED : 0) |
+           (sp_waiting ? FB_SPINDLE_WAITING : 0);
     fb_clamped = false;
     put32(p + 4, board_us());
     int32_t pos[MOTORS];
@@ -763,15 +772,19 @@ void handle_enable(uint16_t seq, const uint8_t *p, uint16_t len) {
         ref_counts[m] = pos[m];
         ref_travel[m] = travel[motor_axis[m]];
     }
-    estop_segments = 0;
-    door_segments  = 0;
-    sp_req_on      = 0;     // ENABLE needs the spindle off, so the session starts with it off
-    sp_req_rpm     = 0;
-    sp_seen_on     = 0;
-    sp_seen_rpm    = 0;
-    sp_running     = false;
-    sp_waiting     = false;
-    fb_sp_refused  = false;
+    estop_segments    = 0;
+    door_segments     = 0;
+    hold_active       = false;
+    hold_still_s      = 0;
+    hold_stop_spindle = false;
+    sp_req_on         = 0;  // ENABLE needs the spindle off, so the session starts with it off
+    sp_req_rpm        = 0;
+    sp_seen_on        = 0;
+    sp_seen_rpm       = 0;
+    sp_running        = false;
+    sp_armed          = false;
+    sp_waiting        = false;
+    fb_sp_refused     = false;
 
     const uint32_t now = board_us();
     for (uint8_t i = 0; i < 2; i++) {
@@ -898,8 +911,15 @@ void spindle_on(float rpm) {
     sp_running = true;
 }
 
+// A start the safety manager allowed: from here an open door means a hold
+void spindle_start(float rpm) {
+    spindle_on(rpm);
+    sp_armed = true;
+}
+
 void spindle_off() {
     sp_waiting = false;
+    sp_armed   = false;
     if (spindle_get_direction() != SPINDLE_OFF) {
         spindle_stop();
     }
@@ -918,7 +938,7 @@ bool spindle_esc_booting() {
 }
 
 // Starts only on an off-to-on change of the host's request, so the spindle never starts by itself:
-// after the safety manager stops it (door, E-stop), it stays off until the host asks again.
+// after the safety manager or a door hold stops it, it stays off until the host asks again.
 void spindle_periodic() {
     if (sp_running && (spindle_get_direction() == SPINDLE_OFF)) {
         sp_running = false;     // stopped by the safety manager or a shutdown
@@ -926,6 +946,16 @@ void spindle_periodic() {
     if (owner != OWNER_PI) {
         spindle_off();          // every board stop ends the spindle
         return;
+    }
+    if (hold_stop_spindle) {
+        // A door hold began. The safety manager stops the spindle too, but it may not see an
+        // opening as short as the hold's two segments.
+        hold_stop_spindle = false;
+        sp_armed          = false;
+        if (spindle_get_direction() != SPINDLE_OFF) {
+            spindle_stop();
+        }
+        sp_running = false;
     }
     const uint8_t on      = sp_req_on;
     const float   rpm     = sp_req_rpm;
@@ -940,19 +970,19 @@ void spindle_periodic() {
     }
     if (start) {
         if (safety_manager->ok_to_spindle()) {
-            spindle_on(rpm);
+            spindle_start(rpm);
         } else if (spindle_esc_booting()) {
             sp_waiting = true;
         } else {
             fb_sp_refused = true;
         }
-    } else if (changed && sp_running) {
-        spindle_on(rpm);        // a new speed
+    } else if (changed && sp_running && sp_armed) {
+        spindle_on(rpm);        // a new speed (not if a hold began since the check above)
     }
     if (sp_waiting) {
         if (safety_manager->ok_to_spindle()) {
             sp_waiting = false;
-            spindle_on(rpm);
+            spindle_start(rpm);
         } else if (!spindle_esc_booting()) {
             sp_waiting    = false;
             fb_sp_refused = true;
@@ -1205,13 +1235,35 @@ stat_t pi_link_exec_move() {
     if (owner == OWNER_PI) {
         // Two segments in a row, so a glitch on the input doesn't stop the job
         estop_segments = estop_input_active() ? (uint8_t)(estop_segments + 1) : 0;
-        // The door opened while the host wants the spindle on: stop rather than feed a stopped
-        // cutter (the safety manager stops the spindle itself). With the spindle off an open door
-        // is allowed, as in stock firmware.
-        door_segments  = (sp_req_on && door_input_active()) ? (uint8_t)(door_segments + 1) : 0;
-        uint8_t reason = stop_request;
+        // The door opened after the spindle started: hold. The spindle stops and the host must
+        // bring every motor to rest within hold_timeout_ms (a pause it can resume), or the board
+        // stops rather than feed a stopped cutter. With the spindle off, or a start that was
+        // refused, an open door is allowed, as in stock firmware.
+        door_segments = (sp_armed && door_input_active()) ? (uint8_t)(door_segments + 1) : 0;
         if (door_segments >= DOOR_SEGMENTS) {
-            reason = REASON_DOOR;
+            door_segments     = 0;
+            sp_armed          = false;
+            hold_stop_spindle = true;
+            if (!hold_active) {
+                hold_active   = true;
+                hold_start_us = t0;
+                hold_still_s  = 0;
+            }
+        }
+        uint8_t reason = stop_request;
+        if (hold_active) {
+            bool still = true;
+            for (uint8_t m = 0; m < PI_MOTORS; m++) {
+                if (fabsf(c.vel[m]) >= HOLD_STILL_RATE) {
+                    still = false;
+                }
+            }
+            hold_still_s = still ? (hold_still_s + link_cfg.seg_s) : 0;
+            if (hold_still_s >= HOLD_STILL_S) {
+                hold_active = false;    // at rest: from here an open door is allowed, e.g. to lift Z
+            } else if (us_since(hold_start_us, t0) > (int32_t)(link_cfg.hold_timeout_ms * 1000UL)) {
+                reason = REASON_DOOR;
+            }
         }
         if (estop_segments >= ESTOP_SEGMENTS) {
             reason = REASON_ESTOP;
